@@ -35,6 +35,18 @@ public class MainForm : Form
         Text = "Считать одним товаром позиции с одинаковым названием и картинкой",
         Checked = true, AutoSize = true, Margin = new Padding(0, 4, 0, 0)
     };
+    private readonly CheckBox chkGeo = new()
+    {
+        Text = "Фильтр по магазинам (target_shops): товар минимум в", AutoSize = true, Margin = new Padding(0, 4, 4, 0)
+    };
+    private readonly NumericUpDown numGeo = new()
+    {
+        Minimum = 1, Maximum = 100, Value = 80, Width = 60, Margin = new Padding(0, 3, 4, 0)
+    };
+    private readonly ComboBox cmbRegion = new()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList, Width = 400, Margin = new Padding(0, 3, 0, 0)
+    };
     private readonly Button btnStart = new() { Text = "Старт", Height = 34, Dock = DockStyle.Fill };
     private readonly Button btnStop = new() { Text = "Стоп", Height = 34, Dock = DockStyle.Fill, Enabled = false };
     private CancellationTokenSource? cts;
@@ -48,11 +60,20 @@ public class MainForm : Form
     {
         Text = "JSON → Excel + картинки";
         Width = 760;
-        Height = 640;
+        Height = 740;
         StartPosition = FormStartPosition.CenterScreen;
 
         cmbPrice.Items.AddRange(new object[] { "Минимальная", "Максимальная", "Средняя", "Медиана" });
         cmbPrice.SelectedIndex = 0;
+
+        // Порядок пунктов совпадает с enum RegionMode
+        cmbRegion.Items.AddRange(new object[]
+        {
+            "Не учитывать регионы",
+            "Один Excel: только товары, которые есть во всех регионах",
+            "Отдельный Excel (папка) на каждый регион"
+        });
+        cmbRegion.SelectedIndex = 0;
 
         var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         settings.Controls.Add(new Label { Text = "Макс. разброс цен по регионам, %:", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
@@ -72,6 +93,15 @@ public class MainForm : Form
         var settings4 = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         settings4.Controls.Add(chkMerge);
 
+        var settings5 = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        settings5.Controls.Add(chkGeo);
+        settings5.Controls.Add(numGeo);
+        settings5.Controls.Add(new Label { Text = "% магазинов", AutoSize = true, Margin = new Padding(0, 6, 0, 0) });
+
+        var settings6 = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        settings6.Controls.Add(new Label { Text = "Регионы (target_regions):", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
+        settings6.Controls.Add(cmbRegion);
+
         var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
         buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 75));
         buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
@@ -80,11 +110,13 @@ public class MainForm : Form
 
         var layout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 9, Padding = new Padding(10)
+            Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 11, Padding = new Padding(10)
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -115,13 +147,19 @@ public class MainForm : Form
         layout.Controls.Add(settings4, 0, 5);
         layout.SetColumnSpan(settings4, 3);
 
-        layout.Controls.Add(buttons, 0, 6);
+        layout.Controls.Add(settings5, 0, 6);
+        layout.SetColumnSpan(settings5, 3);
+
+        layout.Controls.Add(settings6, 0, 7);
+        layout.SetColumnSpan(settings6, 3);
+
+        layout.Controls.Add(buttons, 0, 8);
         layout.SetColumnSpan(buttons, 3);
 
-        layout.Controls.Add(progress, 0, 7);
+        layout.Controls.Add(progress, 0, 9);
         layout.SetColumnSpan(progress, 3);
 
-        layout.Controls.Add(log, 0, 8);
+        layout.Controls.Add(log, 0, 10);
         layout.SetColumnSpan(log, 3);
 
         Controls.Add(layout);
@@ -142,6 +180,10 @@ public class MainForm : Form
 
         // Любое изменение JSON (выбор файла, вставка ссылки или пути) -> папка результата пересчитывается
         txtJson.TextChanged += (_, _) => ApplySuggestion();
+
+        // Охват по магазинам и регионам считается по объединённым товарам, поэтому включаем объединение автоматически
+        chkGeo.CheckedChanged += (_, _) => { if (chkGeo.Checked) chkMerge.Checked = true; };
+        cmbRegion.SelectedIndexChanged += (_, _) => { if (cmbRegion.SelectedIndex > 0) chkMerge.Checked = true; };
 
         btnStart.Click += async (_, _) => await StartAsync();
 
@@ -193,7 +235,7 @@ public class MainForm : Form
     {
         btnStart.Enabled = btnJson.Enabled = btnOut.Enabled = !busy;
         btnStop.Enabled = busy;
-        numSpread.Enabled = cmbPrice.Enabled = numPartMb.Enabled = chkZip.Enabled = numLimit.Enabled = chkMerge.Enabled = !busy;
+        numSpread.Enabled = cmbPrice.Enabled = numPartMb.Enabled = chkZip.Enabled = numLimit.Enabled = chkMerge.Enabled = chkGeo.Enabled = numGeo.Enabled = cmbRegion.Enabled = !busy;
     }
 
     private async Task StartAsync()
@@ -221,6 +263,13 @@ public class MainForm : Form
         bool zip = chkZip.Checked;
         int limit = (int)numLimit.Value;
         bool merge = chkMerge.Checked;
+        bool shopsOn = chkGeo.Checked;
+        decimal shopsPct = numGeo.Value;
+        var regionMode = (RegionMode)cmbRegion.SelectedIndex;   // порядок пунктов совпадает с enum RegionMode
+        string outDir = txtOut.Text.Trim();
+
+        var options = new ConvertOptions(
+            source, outDir, spread, mode, partMb, zip, limit, merge, shopsOn, shopsPct, regionMode);
 
         cts = new CancellationTokenSource();
         var token = cts.Token;
@@ -232,7 +281,7 @@ public class MainForm : Form
         try
         {
             string result = await Task.Run(() =>
-                Converter.RunAsync(source, txtOut.Text, spread, mode, partMb, zip, limit, merge, logProgress, percentProgress, token));
+                Converter.RunAsync(options, logProgress, percentProgress, token));
 
             progress.Value = 100;
             MessageBox.Show($"Готово!\n\n{result}", "JSON → Excel");
