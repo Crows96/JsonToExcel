@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO.Compression;
@@ -11,12 +12,13 @@ namespace JsonToExcel;
 
 public enum PriceMode { Min, Max, Average, Median }
 
-/// <summary>Как использовать регионы (target_regions / region).</summary>
+/// <summary>Как делить выгрузку по гео (target_regions / region / target_shops).</summary>
 public enum RegionMode
 {
     Ignore,       // регионы не учитываем
     AllRegions,   // один Excel: только товары, которые есть во всех регионах
-    PerRegion     // отдельный Excel (папка) на каждый регион
+    PerRegion,    // отдельный Excel (папка) на каждый регион (название папки = значение из target_regions)
+    PerShop       // отдельный Excel (папка) на каждый магазин/адрес (название папки = значение из target_shops)
 }
 
 public sealed record ConvertOptions(
@@ -30,14 +32,18 @@ public sealed record ConvertOptions(
     bool MergeSame,             // объединять товары с одинаковым названием и картинкой
     bool ShopFilter,            // фильтр по магазинам (target_shops)
     decimal ShopPercent,        // минимум % магазинов
-    RegionMode RegionMode);
+    RegionMode RegionMode,
+    RecodeOptions Recode,       // сжатие картинок
+    int DownloadThreads,        // сколько картинок скачивать одновременно
+    bool Economy);              // режим для слабого ПК: меньше потоков и нагрузки
 
 public static class Converter
 {
     // ======================= Модель данных =======================
 
-    // Цена одного оффера и каталоги (гео), в которых он лежит
-    private readonly record struct PriceEntry(decimal Price, List<int>? Cats);
+    // Цена одного оффера (0 — цены нет) и код каталога (гео): >= 0 — один каталог,
+    // -1 — нет каталога, <= -2 — оффер лежит в нескольких каталогах (индекс в GeoModel.Multi = -Cat - 2)
+    private readonly record struct PriceEntry(decimal Price, int Cat);
 
     private sealed class Group
     {
@@ -53,6 +59,8 @@ public static class Converter
     private sealed class GeoModel
     {
         public List<string> RegionNames = new();
+        public List<string> ShopNames = new();                            // индекс магазина -> значение из target_shops
+        public List<int[]> Multi = new();                                 // офферы, лежащие в нескольких каталогах
         public int[][] CatRegions = Array.Empty<int[]>();                 // каталог -> регионы
         public int[][] CatShops = Array.Empty<int[]>();                   // каталог -> магазины
         public Dictionary<int, HashSet<int>> RegionShops = new();         // регион -> магазины его каталогов
@@ -66,6 +74,8 @@ public static class Converter
         public string Title = "";
         public string Dir = "";
         public int Region = -1;                         // -1 — все регионы
+        public int Shop = -1;                           // -1 — не по магазину; иначе выгрузка одного магазина
+        public string Kind = "Регион";                  // подпись для лога: «Регион» / «Магазин»
         public List<Group> Candidates = new();
         public HashSet<int> ShopSet = new();            // магазины, по которым считаем охват
     }
@@ -107,6 +117,67 @@ public static class Converter
             log.Report("Остановлено. Временные файлы удалены.");
             throw;
         }
+    }
+
+    /// <summary>Обрабатывает несколько JSON по очереди; каждый файл — отдельная выгрузка в своей папке.</summary>
+    public static async Task<string> RunBatchAsync(
+        IReadOnlyList<ConvertOptions> items, IProgress<string> log, IProgress<int> percent, CancellationToken ct)
+    {
+        int n = items.Count;
+        int ok = 0;
+        var errors = new List<string>();
+
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var item = items[i];
+                if (n > 1) log.Report($"########## Файл {i + 1} из {n}: {item.JsonSource} ##########");
+
+                int fileIndex = i;
+                var filePercent = new DelegateProgress<int>(p => percent.Report((fileIndex * 100 + p) / n));
+                try
+                {
+                    await RunAsync(item, log, filePercent, ct);
+                    ok++;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (n > 1)
+                {
+                    // Один «плохой» файл не должен останавливать остальные
+                    errors.Add($"{item.JsonSource}: {ex.Message}");
+                    log.Report($"ОШИБКА в файле {item.JsonSource}: {ex.Message}");
+                }
+
+                // Между файлами освобождаем память
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            if (n > 1)
+            {
+                try
+                {
+                    var parent = Path.GetDirectoryName(Path.GetFullPath(items[0].OutDir));
+                    if (parent != null && Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any())
+                        Directory.Delete(parent);
+                }
+                catch { }
+            }
+            throw;
+        }
+
+        percent.Report(100);
+        var sb = new StringBuilder();
+        sb.Append($"Обработано файлов: {ok} из {n}");
+        foreach (var e in errors) sb.Append("\n  ✗ ").Append(e);
+        return sb.ToString();
     }
 
     private static void CleanupAfterCancel(string outDir, List<string> createdParts)
@@ -161,6 +232,9 @@ public static class Converter
         private readonly string outDir;
         private readonly string cacheDir;                       // временная папка для скачанных картинок
         private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(60) };
+        private readonly int downloadThreads;
+        private readonly SemaphoreSlim encodeGate;                  // сколько картинок одновременно сжимается
+        private long bytesIn, bytesOut;                             // объём картинок до и после сжатия
 
         // Имя картинки в Excel/частях (читаемое, уникальное) и имя файла в кэше (по хэшу ссылки)
         private readonly Dictionary<string, string> urlToName = new();
@@ -183,12 +257,16 @@ public static class Converter
             outDir = opt.OutDir;
             cacheDir = Path.Combine(outDir, "_cache");
             http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0");
+
+            downloadThreads = Math.Clamp(opt.DownloadThreads, 1, 64);
+            int encodeThreads = opt.Economy ? 1 : Math.Max(1, Environment.ProcessorCount - 1);
+            encodeGate = new SemaphoreSlim(encodeThreads, encodeThreads);
         }
 
         public async Task<string> RunAsync()
         {
             try { return await CoreAsync(); }
-            finally { http.Dispose(); }
+            finally { http.Dispose(); encodeGate.Dispose(); }
         }
 
         // Общий прогресс: каждая выгрузка занимает свою долю шкалы (внутри: 0–80% скачивание, 80–99% упаковка)
@@ -225,6 +303,7 @@ public static class Converter
             // ---------- 1. Читаем JSON и группируем записи по товару ----------
             log.Report("Читаю JSON...");
             var (groups, offersCount, geo) = ReadGroups(jsonPath, ct);
+            GC.Collect();   // служебные структуры чтения больше не нужны
             ct.ThrowIfCancellationRequested();
             log.Report($"Записей в JSON: {offersCount}, уникальных товаров (по коду): {groups.Count}");
             if (geo.UsedShops.Count > 0 || geo.UsedRegions.Count > 0)
@@ -260,6 +339,9 @@ public static class Converter
             // оставляем её: при повторном запуске докачаются только недостающие.
             Cleanup(keepCache: !failed.IsEmpty);
 
+            if (opt.Recode.Enabled && bytesIn > 0)
+                log.Report($"Картинки после сжатия: {bytesIn / 1048576.0:F0} МБ → {bytesOut / 1048576.0:F0} МБ " +
+                           $"(в {(double)bytesIn / Math.Max(1, bytesOut):F1} раза меньше)");
             log.Report($"Готово. Результат: {outDir}");
             if (!failed.IsEmpty)
             {
@@ -277,9 +359,14 @@ public static class Converter
             var scopes = new List<Scope>();
             var mode = opt.RegionMode;
 
-            if (mode != RegionMode.Ignore && geo.UsedRegions.Count == 0)
+            if ((mode == RegionMode.AllRegions || mode == RegionMode.PerRegion) && geo.UsedRegions.Count == 0)
             {
                 log.Report("В файле нет регионов (target_regions / region) — режим регионов не применяется.");
+                mode = RegionMode.Ignore;
+            }
+            if (mode == RegionMode.PerShop && geo.UsedShops.Count == 0)
+            {
+                log.Report("В файле нет магазинов (target_shops) — разбивка по магазинам не применяется.");
                 mode = RegionMode.Ignore;
             }
 
@@ -326,6 +413,29 @@ public static class Converter
                     log.Report($"Режим регионов: отдельный Excel на каждый регион — регионов: {scopes.Count}");
                     break;
                 }
+                case RegionMode.PerShop:
+                {
+                    var usedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (int s in geo.UsedShops.OrderBy(x => x))
+                    {
+                        var cand = groups.Where(g => g.Shops.Contains(s)).ToList();
+                        if (cand.Count == 0) continue;
+
+                        string shopName = geo.ShopNames[s];
+                        string folder = UniqueName(SafeFolderName(shopName, "shop"), usedDirs);
+                        scopes.Add(new Scope
+                        {
+                            Title = shopName,
+                            Kind = "Магазин",
+                            Shop = s,
+                            Dir = Path.Combine(outDir, folder),
+                            Candidates = cand,
+                            ShopSet = new HashSet<int> { s }
+                        });
+                    }
+                    log.Report($"Режим: отдельный Excel на каждый магазин (target_shops) — магазинов: {scopes.Count}");
+                    break;
+                }
                 default:
                     scopes.Add(new Scope { Dir = outDir, Candidates = groups, ShopSet = geo.UsedShops });
                     break;
@@ -339,12 +449,12 @@ public static class Converter
             string tag = scope.Title.Length > 0 ? $"[{scope.Title}] " : "";
             void L(string msg) => log.Report(tag + msg);
 
-            if (scope.Title.Length > 0) log.Report($"=== Регион: {scope.Title} ===");
+            if (scope.Title.Length > 0) log.Report($"=== {scope.Kind}: {scope.Title} ===");
 
             // --- Отбор: охват по магазинам и разброс цен ---
             bool useShops = false;
             int needShops = 0;
-            if (opt.ShopFilter)
+            if (opt.ShopFilter && scope.Shop < 0)   // в выгрузке одного магазина охват по магазинам не нужен
             {
                 if (scope.ShopSet.Count > 1)
                 {
@@ -487,7 +597,7 @@ public static class Converter
                     foreach (var img in part.Images)
                     {
                         ct.ThrowIfCancellationRequested();
-                        za.CreateEntryFromFile(CachePath(img), img, CompressionLevel.Fastest);
+                        za.CreateEntryFromFile(CachePath(img), img, CompressionLevel.NoCompression);   // картинки уже сжаты — архив только упаковывает
                     }
                 }
                 else
@@ -528,7 +638,12 @@ public static class Converter
             }
             ws.Column(4).Style.DateFormat.Format = "dd.mm.yyyy";
             ws.Column(5).Style.DateFormat.Format = "dd.mm.yyyy";
-            ws.Columns().AdjustToContents();
+            // AdjustToContents на больших листах очень медленный — задаём ширину колонок явно
+            ws.Column(1).Width = 60;
+            ws.Column(2).Width = 40;
+            ws.Column(3).Width = 12;
+            ws.Column(4).Width = 12;
+            ws.Column(5).Width = 12;
             wb.SaveAs(path);
         }
 
@@ -569,7 +684,9 @@ public static class Converter
             var result = new List<decimal>(g.Offers.Count);
             foreach (var e in g.Offers)
             {
+                if (e.Price <= 0) continue;                      // оффер без корректной цены
                 if (scope.Region >= 0 && !InRegion(e, scope.Region)) continue;
+                if (scope.Shop >= 0 && !InShop(e, scope.Shop)) continue;
                 result.Add(e.Price);
             }
             return result;
@@ -577,12 +694,37 @@ public static class Converter
 
         private GeoModel? currentGeo;   // заполняется при чтении, нужен для проверки региона оффера
 
-        private bool InRegion(PriceEntry e, int region)
+        private bool InRegion(PriceEntry e, int region) =>
+            currentGeo != null && CodeHas(currentGeo, currentGeo.CatRegions, e.Cat, region);
+
+        private bool InShop(PriceEntry e, int shop) =>
+            currentGeo != null && CodeHas(currentGeo, currentGeo.CatShops, e.Cat, shop);
+
+        private static bool CodeHas(GeoModel geo, int[][] sets, int code, int value)
         {
-            if (e.Cats == null || currentGeo == null) return false;
-            foreach (var ci in e.Cats)
-                if (Array.IndexOf(currentGeo.CatRegions[ci], region) >= 0) return true;
+            if (code >= 0) return Array.IndexOf(sets[code], value) >= 0;
+            if (code <= -2)
+                foreach (var ci in geo.Multi[-code - 2])
+                    if (Array.IndexOf(sets[ci], value) >= 0) return true;
             return false;
+        }
+
+        // Добавляет магазины и регионы каталога (или нескольких каталогов) в товар
+        private static void AddGeo(Group g, GeoModel geo, int code)
+        {
+            if (code >= 0)
+            {
+                g.Shops.UnionWith(geo.CatShops[code]);
+                g.Regions.UnionWith(geo.CatRegions[code]);
+            }
+            else if (code <= -2)
+            {
+                foreach (var ci in geo.Multi[-code - 2])
+                {
+                    g.Shops.UnionWith(geo.CatShops[ci]);
+                    g.Regions.UnionWith(geo.CatRegions[ci]);
+                }
+            }
         }
 
         // ---------- Картинки ----------
@@ -596,7 +738,7 @@ public static class Converter
             return fi.Exists && fi.Length > 0;
         }
 
-        // Назначает имена файлов и скачивает те картинки, которые ещё не обрабатывались
+        // Назначает имена файлов и скачивает (и при необходимости сжимает) картинки, которые ещё не обрабатывались
         private async Task EnsureImagesAsync(IEnumerable<string?> urls, Action<int, int>? onProgress)
         {
             var todo = new Dictionary<string, string>();
@@ -605,13 +747,15 @@ public static class Converter
                 if (urlToName.ContainsKey(url!)) continue;      // уже обработана раньше
 
                 string name = MakeFileName(url!);
+                // При сжатии формат меняется, поэтому и расширение в имени (и в Excel) берём новое
+                if (opt.Recode.Enabled) name = Path.GetFileNameWithoutExtension(name) + opt.Recode.Extension;
                 string unique = name;
                 int k = 1;
                 while (!usedNames.Add(unique))
                     unique = $"{Path.GetFileNameWithoutExtension(name)}_{k++}{Path.GetExtension(name)}";
 
                 urlToName[url!] = unique;
-                nameToCache[unique] = CacheName(url!, unique);
+                nameToCache[unique] = CacheName(url!, unique, opt.Recode.Signature);
                 todo[url!] = unique;
             }
             if (todo.Count == 0) return;
@@ -619,24 +763,28 @@ public static class Converter
 
             int done = 0;
             int total = todo.Count;
-            await Parallel.ForEachAsync(todo, new ParallelOptions { MaxDegreeOfParallelism = 16, CancellationToken = ct },
+            await Parallel.ForEachAsync(todo,
+                new ParallelOptions { MaxDegreeOfParallelism = downloadThreads, CancellationToken = ct },
                 async (pair, token) =>
                 {
                     string path = CachePath(pair.Value);
                     if (!(File.Exists(path) && new FileInfo(path).Length > 0))   // уже скачано — пропускаем
                     {
-                        bool ok = false;
-                        for (int attempt = 1; attempt <= 3 && !ok; attempt++)
+                        for (int attempt = 1; attempt <= 3; attempt++)
                         {
                             try
                             {
-                                var bytes = await http.GetByteArrayAsync(pair.Key, token);
-                                await File.WriteAllBytesAsync(path, bytes, token);
-                                ok = true;
+                                await FetchImageAsync(pair.Key, path, token);
+                                break;
                             }
                             catch (OperationCanceledException) when (token.IsCancellationRequested)
                             {
                                 throw;                       // «Стоп» — не считаем ошибкой скачивания
+                            }
+                            catch (InvalidDataException ex)
+                            {
+                                failed.Add($"{pair.Key} -> {ex.Message}");   // не картинка — повторять бессмысленно
+                                break;
                             }
                             catch (Exception) when (attempt < 3)
                             {
@@ -653,19 +801,56 @@ public static class Converter
                 });
         }
 
+        // Скачивает одну картинку в кэш. Пишет во временный файл и переименовывает после успеха,
+        // поэтому недокачанный файл никогда не принимается за готовый.
+        private async Task FetchImageAsync(string url, string path, CancellationToken token)
+        {
+            string tmp = path + ".part";
+            try
+            {
+                using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token);
+                resp.EnsureSuccessStatusCode();
+
+                if (!opt.Recode.Enabled)
+                {
+                    // Без сжатия: поток прямо на диск, картинка целиком в памяти не держится
+                    await using (var src = await resp.Content.ReadAsStreamAsync(token))
+                    await using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
+                        await src.CopyToAsync(dst, 81920, token);
+                }
+                else
+                {
+                    byte[] bytes = await resp.Content.ReadAsByteArrayAsync(token);
+
+                    // Сжатие — самая тяжёлая для процессора часть, одновременно их идёт ограниченное число
+                    byte[] result;
+                    await encodeGate.WaitAsync(token);
+                    try { result = ImageRecoder.Recode(bytes, opt.Recode).Data; }
+                    finally { encodeGate.Release(); }
+
+                    await File.WriteAllBytesAsync(tmp, result, token);
+                    Interlocked.Add(ref bytesIn, bytes.Length);
+                    Interlocked.Add(ref bytesOut, result.Length);
+                }
+
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                throw;
+            }
+        }
+
         // ---------- Чтение JSON ----------
-        // Весь DOM живёт только внутри этого метода и освобождается до скачивания картинок.
+        // JSON читается потоком (Utf8JsonReader): в памяти одновременно только один оффер, поэтому расход
+        // памяти зависит от числа уникальных товаров, а не от размера файла. Два прохода по файлу:
+        // сначала каталоги (география), затем офферы.
         private (List<Group> Groups, int OffersCount, GeoModel Geo) ReadGroups(string jsonPath, CancellationToken ct)
         {
             var list = new List<Group>();
             var index = new Dictionary<string, Group>();
             int count = 0;
-
-            using var fs = File.OpenRead(jsonPath);
-            using var doc = JsonDocument.Parse(fs);
-
-            if (!doc.RootElement.TryGetProperty("offers", out var offers) || offers.ValueKind != JsonValueKind.Array)
-                throw new Exception("В JSON нет массива \"offers\".");
 
             // --- География из каталогов: target_shops (магазины), target_regions или region (регионы) ---
             var geo = new GeoModel();
@@ -673,62 +858,85 @@ public static class Converter
             var regionIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             var catRegions = new List<int[]>();
             var catShops = new List<int[]>();
-            var offerCats = new Dictionary<string, List<int>>();     // id оффера -> каталоги, где он есть
 
-            if (doc.RootElement.TryGetProperty("catalogs", out var catalogs) && catalogs.ValueKind == JsonValueKind.Array)
+            // 64-битный хэш id оффера -> каталог (или код нескольких каталогов, см. PriceEntry.Cat).
+            // Хэш вместо строки-ключа: в разы меньше памяти на миллионах офферов.
+            var offerCats = new Dictionary<ulong, int>();
+
+            // Проход 1: каталоги
+            ScanArray(jsonPath, "catalogs", c =>
             {
-                foreach (var c in catalogs.EnumerateArray())
+                int ci = catRegions.Count;
+
+                var regions = new HashSet<int>();
+                foreach (var name in GetStringList(c, "target_regions"))
+                    regions.Add(Intern(regionIndex, geo.RegionNames, name));
+                if (regions.Count == 0)
                 {
-                    int ci = catRegions.Count;
+                    string? one = GetString(c, "region");
+                    if (!string.IsNullOrWhiteSpace(one)) regions.Add(Intern(regionIndex, geo.RegionNames, one));
+                }
 
-                    var regions = new HashSet<int>();
-                    foreach (var name in GetStringList(c, "target_regions"))
-                        regions.Add(Intern(regionIndex, geo.RegionNames, name));
-                    if (regions.Count == 0)
+                var shops = new HashSet<int>();
+                foreach (var name in GetStringList(c, "target_shops"))
+                    shops.Add(Intern(shopIndex, geo.ShopNames, name));
+
+                catRegions.Add(regions.ToArray());
+                catShops.Add(shops.ToArray());
+
+                foreach (var r in regions)
+                {
+                    if (!geo.RegionShops.TryGetValue(r, out var rs)) geo.RegionShops[r] = rs = new HashSet<int>();
+                    rs.UnionWith(shops);
+                }
+
+                if (c.TryGetProperty("offers", out var ids) && ids.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var idEl in ids.EnumerateArray())
                     {
-                        string? one = GetString(c, "region");
-                        if (!string.IsNullOrWhiteSpace(one)) regions.Add(Intern(regionIndex, geo.RegionNames, one));
-                    }
+                        if (idEl.ValueKind != JsonValueKind.String) continue;
+                        string? oid = idEl.GetString();
+                        if (string.IsNullOrEmpty(oid)) continue;
 
-                    var shops = new HashSet<int>();
-                    foreach (var name in GetStringList(c, "target_shops"))
-                        shops.Add(Intern(shopIndex, null, name));
-
-                    catRegions.Add(regions.ToArray());
-                    catShops.Add(shops.ToArray());
-
-                    foreach (var r in regions)
-                    {
-                        if (!geo.RegionShops.TryGetValue(r, out var rs)) geo.RegionShops[r] = rs = new HashSet<int>();
-                        rs.UnionWith(shops);
-                    }
-
-                    if (c.TryGetProperty("offers", out var ids) && ids.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var idEl in ids.EnumerateArray())
+                        ulong h = HashId(oid);
+                        if (!offerCats.TryGetValue(h, out var code))
                         {
-                            if (idEl.ValueKind != JsonValueKind.String) continue;
-                            string? oid = idEl.GetString();
-                            if (string.IsNullOrEmpty(oid)) continue;
-
-                            if (!offerCats.TryGetValue(oid, out var cl))
-                                offerCats[oid] = cl = new List<int>(1);
-                            if (!cl.Contains(ci)) cl.Add(ci);
+                            offerCats[h] = ci;
+                        }
+                        else if (code == ci)
+                        {
+                            // повтор id внутри одного каталога
+                        }
+                        else if (code >= 0)
+                        {
+                            geo.Multi.Add(new[] { code, ci });
+                            offerCats[h] = -(geo.Multi.Count - 1) - 2;
+                        }
+                        else
+                        {
+                            int mi = -code - 2;
+                            var old = geo.Multi[mi];
+                            if (Array.IndexOf(old, ci) < 0)
+                            {
+                                var arr = new int[old.Length + 1];
+                                old.CopyTo(arr, 0);
+                                arr[^1] = ci;
+                                geo.Multi[mi] = arr;
+                            }
                         }
                     }
-                    ct.ThrowIfCancellationRequested();
                 }
-            }
+            }, ct);
+
             geo.CatRegions = catRegions.ToArray();
             geo.CatShops = catShops.ToArray();
             currentGeo = geo;
 
-            // --- Офферы ---
-            foreach (var o in offers.EnumerateArray())
+            // Проход 2: офферы
+            int nextLog = 10;
+            bool found = ScanArray(jsonPath, "offers", o =>
             {
                 count++;
-                if ((count & 1023) == 0) ct.ThrowIfCancellationRequested();
-                string description = GetString(o, "description") ?? "";
                 string id = GetString(o, "id") ?? "";
 
                 // id вида "<код товара>_<регион/магазин>" -> ключ товара = часть до первого "_".
@@ -736,38 +944,45 @@ public static class Converter
                 string key;
                 int us = id.IndexOf('_');
                 if (us > 0) key = id[..us];
-                else key = id.Length > 0 ? id : description;
+                else key = id.Length > 0 ? id : (GetString(o, "description") ?? "");
 
-                if (!index.TryGetValue(key, out var g))
+                if (!index.TryGetValue(key, out var grp))
                 {
-                    g = new Group();
-                    index[key] = g;
-                    list.Add(g);
+                    grp = new Group();
+                    index[key] = grp;
+                    list.Add(grp);
                 }
 
-                if (g.Description.Length == 0) g.Description = description;
-                if (string.IsNullOrWhiteSpace(g.ImageUrl)) g.ImageUrl = GetString(o, "image");
-                g.DateStart ??= GetDate(o, "date_start");
-                g.DateEnd ??= GetDate(o, "date_end");
+                // Текст, ссылку и даты читаем только пока они не найдены — лишних строк не создаём
+                if (grp.Description.Length == 0) grp.Description = GetString(o, "description") ?? "";
+                if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = GetString(o, "image");
+                if (!grp.DateStart.HasValue) grp.DateStart = GetDate(o, "date_start");
+                if (!grp.DateEnd.HasValue) grp.DateEnd = GetDate(o, "date_end");
 
-                offerCats.TryGetValue(id, out var cats);
-
+                int cat = (id.Length > 0 && offerCats.TryGetValue(HashId(id), out var cc)) ? cc : -1;
                 var price = GetDecimal(o, "price_new");
-                if (price.HasValue && price.Value > 0) g.Offers.Add(new PriceEntry(price.Value, cats));
-
-                if (cats != null)
+                grp.Offers.Add(new PriceEntry(price.HasValue && price.Value > 0 ? price.Value : 0m, cat));
+            }, ct, p =>
+            {
+                if (p >= nextLog)
                 {
-                    foreach (var ci in cats)
-                    {
-                        g.Shops.UnionWith(geo.CatShops[ci]);
-                        g.Regions.UnionWith(geo.CatRegions[ci]);
-                    }
+                    log.Report($"Чтение товаров: {p}%");
+                    nextLog = p / 10 * 10 + 10;
                 }
-            }
+            });
 
-            // Считаем только магазины и регионы, в которых реально есть товары (пустые каталоги не учитываем)
+            if (!found) throw new Exception("В JSON нет массива \"offers\".");
+
+            // Магазины и регионы товара считаем один раз по уникальным каталогам его офферов.
+            // Учитываем только магазины и регионы, в которых реально есть товары (пустые каталоги не считаем).
             foreach (var g in list)
             {
+                ct.ThrowIfCancellationRequested();
+                var seen = new HashSet<int>();
+                foreach (var e in g.Offers)
+                    if (e.Cat != -1 && seen.Add(e.Cat)) AddGeo(g, geo, e.Cat);
+
+                g.Offers.TrimExcess();
                 geo.UsedShops.UnionWith(g.Shops);
                 geo.UsedRegions.UnionWith(g.Regions);
             }
@@ -777,6 +992,141 @@ public static class Converter
     }
 
     // ======================= Вспомогательные функции =======================
+
+    // Потоковое чтение: находит в корне JSON массив с именем property и вызывает onElement для каждого
+    // элемента-объекта. В памяти одновременно лежат только буфер (~1 МБ) и один элемент.
+    // Возвращает false, если такого массива в файле нет.
+    private static bool ScanArray(string path, string property, Action<JsonElement> onElement,
+                                  CancellationToken ct, Action<int>? onPercent = null)
+    {
+        var options = new JsonReaderOptions
+        {
+            AllowTrailingCommas = true,
+            CommentHandling = JsonCommentHandling.Skip
+        };
+
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                                      FileOptions.SequentialScan);
+        long length = Math.Max(1, fs.Length);
+
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(1 << 20);
+        try
+        {
+            int have = 0;                       // сколько байт сейчас лежит в буфере
+            bool eof = false, first = true;
+            bool inTarget = false, inArray = false, found = false, done = false;
+            int counter = 0, lastPercent = -1;
+            var state = new JsonReaderState(options);
+
+            while (!done)
+            {
+                // Дочитываем буфер
+                while (!eof && have < buffer.Length)
+                {
+                    int n = fs.Read(buffer, have, buffer.Length - have);
+                    if (n == 0) { eof = true; break; }
+                    have += n;
+                }
+
+                if (first)
+                {
+                    first = false;
+                    // Utf8JsonReader сам BOM не пропускает
+                    if (have >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+                    {
+                        buffer.AsSpan(3, have - 3).CopyTo(buffer);
+                        have -= 3;
+                    }
+                }
+
+                var reader = new Utf8JsonReader(buffer.AsSpan(0, have), eof, state);
+                bool needMore = false;
+
+                while (true)
+                {
+                    var before = reader;
+                    if (!reader.Read()) break;
+
+                    var token = reader.TokenType;
+                    int depth = reader.CurrentDepth;
+
+                    if (depth == 1 && token == JsonTokenType.PropertyName)
+                    {
+                        inTarget = reader.ValueTextEquals(property);
+                    }
+                    else if (depth == 1 && token == JsonTokenType.StartArray && inTarget)
+                    {
+                        inArray = true;
+                        found = true;
+                    }
+                    else if (depth == 1 && token == JsonTokenType.EndArray && inArray)
+                    {
+                        done = true;                    // нужный массив прочитан целиком
+                        break;
+                    }
+                    else if (depth == 2 && token == JsonTokenType.StartObject && inArray)
+                    {
+                        // Элемент должен целиком поместиться в буфер, иначе дочитываем файл и повторяем
+                        var probe = reader;
+                        if (!probe.TrySkip())
+                        {
+                            reader = before;
+                            needMore = true;
+                            break;
+                        }
+
+                        using var doc = JsonDocument.ParseValue(ref reader);
+                        onElement(doc.RootElement);
+
+                        if ((++counter & 255) == 0)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            if (onPercent != null)
+                            {
+                                int p = (int)(fs.Position * 100 / length);
+                                if (p != lastPercent) { lastPercent = p; onPercent(p); }
+                            }
+                        }
+                    }
+                }
+
+                if (done) break;
+                if (eof && !needMore) break;            // файл закончился
+
+                state = reader.CurrentState;
+                int consumed = (int)reader.BytesConsumed;
+                int left = have - consumed;
+                if (left > 0 && consumed > 0) buffer.AsSpan(consumed, left).CopyTo(buffer);
+                have = left;
+
+                if (have == buffer.Length)              // один элемент не поместился — увеличиваем буфер
+                {
+                    var bigger = ArrayPool<byte>.Shared.Rent(buffer.Length * 2);
+                    buffer.AsSpan(0, have).CopyTo(bigger);
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    buffer = bigger;
+                }
+                ct.ThrowIfCancellationRequested();
+            }
+            return found;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    // 64-битный хэш (FNV-1a) строки: ключ для таблицы «оффер -> каталог» без хранения самих строк
+    private static ulong HashId(string s)
+    {
+        ulong h = 14695981039346656037UL;
+        foreach (char ch in s)
+        {
+            h ^= ch;
+            h *= 1099511628211UL;
+        }
+        return h;
+    }
 
     private static async Task DownloadJsonAsync(string url, string path, IProgress<string> log, CancellationToken ct)
     {
@@ -886,12 +1236,12 @@ public static class Converter
         }
     }
 
-    private static string SafeFolderName(string name)
+    private static string SafeFolderName(string name, string fallback = "region")
     {
         foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
         name = Regex.Replace(name, @"\s+", " ").Trim().TrimEnd('.');
         if (name.Length > 80) name = name[..80].TrimEnd();
-        return name.Length == 0 ? "region" : name;
+        return name.Length == 0 ? fallback : name;
     }
 
     private static string UniqueName(string name, HashSet<string> used)
@@ -971,10 +1321,19 @@ public static class Converter
         return stem + ext;
     }
 
-    // Имя файла в кэше зависит только от ссылки — устаревшие файлы от другого запуска не подменят картинку
-    private static string CacheName(string url, string displayName) =>
-        HashHex(url, 20) + Path.GetExtension(displayName);
+    // Имя файла в кэше зависит от ссылки и настроек сжатия — устаревшие файлы от другого запуска
+    // (с другим качеством или размером) не подменят картинку
+    private static string CacheName(string url, string displayName, string signature) =>
+        HashHex(url + "|" + signature, 20) + Path.GetExtension(displayName);
 
     private static string HashHex(string text, int length) =>
         Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(text)))[..length];
+}
+
+/// <summary>Синхронный IProgress: вызывает делегат сразу в том же потоке (Progress&lt;T&gt; может менять порядок вызовов).</summary>
+internal sealed class DelegateProgress<T> : IProgress<T>
+{
+    private readonly Action<T> action;
+    public DelegateProgress(Action<T> action) => this.action = action;
+    public void Report(T value) => action(value);
 }
