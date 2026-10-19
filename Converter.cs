@@ -6,11 +6,16 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 using ClosedXML.Excel;
 
 namespace JsonToExcel;
 
 public enum PriceMode { Min, Max, Average, Median }
+
+/// <summary>Формат исходного файла (определяется по содержимому).</summary>
+public enum SourceFormat { Json, Xml }
 
 /// <summary>Как делить выгрузку по гео (target_regions / region / target_shops).</summary>
 public enum RegionMode
@@ -35,10 +40,14 @@ public sealed record ConvertOptions(
     RegionMode RegionMode,
     RecodeOptions Recode,       // сжатие картинок
     int DownloadThreads,        // сколько картинок скачивать одновременно
-    bool Economy);              // режим для слабого ПК: меньше потоков и нагрузки
+    bool Economy,               // режим для слабого ПК: меньше потоков и нагрузки
+    bool PromoOnly);            // только акционные позиции: в оффере есть price_old (старая цена)
 
 public static class Converter
 {
+    // YML-фиды часто в windows-1251: в .NET такие кодировки доступны только после регистрации провайдера
+    static Converter() => Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
     // ======================= Модель данных =======================
 
     // Цена одного оффера (0 — цены нет) и код каталога (гео): >= 0 — один каталог,
@@ -54,6 +63,7 @@ public static class Converter
         public HashSet<int> Regions = new();    // регионы (target_regions / region), где есть товар
         public DateTime? DateStart;
         public DateTime? DateEnd;
+        public decimal? OldPrice;               // старая (обычная) цена — есть в YML (oldprice)
     }
 
     private sealed class GeoModel
@@ -85,7 +95,7 @@ public static class Converter
         public int Dropped, NoPrice, Single, Equal, Similar, ShopDropped;
     }
 
-    private sealed record Row(string Description, string? ImageFile, decimal Price, DateTime? DateStart, DateTime? DateEnd);
+    private sealed record Row(string Description, string? ImageFile, decimal Price, DateTime? DateStart, DateTime? DateEnd, decimal? OldPrice = null);
 
     private sealed class Part
     {
@@ -126,6 +136,7 @@ public static class Converter
         int n = items.Count;
         int ok = 0;
         var errors = new List<string>();
+        var keptCache = new List<string>();      // файлы, у которых остался _cache (не все картинки скачались)
 
         try
         {
@@ -141,6 +152,7 @@ public static class Converter
                 {
                     await RunAsync(item, log, filePercent, ct);
                     ok++;
+                    if (Directory.Exists(Path.Combine(item.OutDir, "_cache"))) keptCache.Add(item.JsonSource);
                 }
                 catch (OperationCanceledException)
                 {
@@ -177,6 +189,11 @@ public static class Converter
         var sb = new StringBuilder();
         sb.Append($"Обработано файлов: {ok} из {n}");
         foreach (var e in errors) sb.Append("\n  ✗ ").Append(e);
+        if (keptCache.Count > 0)
+        {
+            sb.Append("\n⚠ Часть картинок не скачалась, папка _cache оставлена (повторный запуск докачает недостающее):");
+            foreach (var k in keptCache) sb.Append("\n  ").Append(k);
+        }
         return sb.ToString();
     }
 
@@ -240,7 +257,8 @@ public static class Converter
         private readonly Dictionary<string, string> urlToName = new();
         private readonly Dictionary<string, string> nameToCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> usedNames = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentBag<string> failed = new();
+        private readonly ConcurrentBag<string> failed = new();        // временные сбои: повторный запуск может помочь
+        private readonly ConcurrentBag<string> missing = new();       // картинки нет на сервере (404/410) или это не картинка
 
         private string? tempJson;
         private int scopeIndex;
@@ -266,6 +284,19 @@ public static class Converter
         public async Task<string> RunAsync()
         {
             try { return await CoreAsync(); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Ошибка посреди работы: _cache и _source.json не оставляем
+                // (при «Стоп» временные файлы убирает внешний код)
+                Cleanup(keepCache: false);
+                try
+                {
+                    if (Directory.Exists(outDir) && !Directory.EnumerateFileSystemEntries(outDir).Any())
+                        Directory.Delete(outDir);   // пустую папку результата тоже убираем
+                }
+                catch { }
+                throw;
+            }
             finally { http.Dispose(); encodeGate.Dispose(); }
         }
 
@@ -279,11 +310,19 @@ public static class Converter
             {
                 try { File.Delete(tempJson); } catch { }
             }
-            if (!keepCache)
+            if (!keepCache && Directory.Exists(cacheDir))
             {
                 try { Directory.Delete(cacheDir, true); }
                 catch (Exception ex) { log.Report("Не удалось удалить временную папку _cache: " + ex.Message); }
             }
+
+            // Если выгружать оказалось нечего, пустую папку результата не оставляем
+            try
+            {
+                if (Directory.Exists(outDir) && !Directory.EnumerateFileSystemEntries(outDir).Any())
+                    Directory.Delete(outDir);
+            }
+            catch { }
         }
 
         private async Task<string> CoreAsync()
@@ -301,11 +340,14 @@ public static class Converter
             }
 
             // ---------- 1. Читаем JSON и группируем записи по товару ----------
-            log.Report("Читаю JSON...");
-            var (groups, offersCount, geo) = ReadGroups(jsonPath, ct);
+            var format = DetectFormat(jsonPath);
+            log.Report(format == SourceFormat.Xml ? "Читаю YML (XML)..." : "Читаю JSON...");
+            var (groups, offersCount, geo) = format == SourceFormat.Xml
+                ? ReadGroupsXml(jsonPath, ct)
+                : ReadGroups(jsonPath, ct);
             GC.Collect();   // служебные структуры чтения больше не нужны
             ct.ThrowIfCancellationRequested();
-            log.Report($"Записей в JSON: {offersCount}, уникальных товаров (по коду): {groups.Count}");
+            log.Report($"Записей в файле: {offersCount}, уникальных товаров: {groups.Count}");
             if (geo.UsedShops.Count > 0 || geo.UsedRegions.Count > 0)
                 log.Report($"География: магазинов — {geo.UsedShops.Count}, регионов — {geo.UsedRegions.Count}");
 
@@ -343,6 +385,11 @@ public static class Converter
                 log.Report($"Картинки после сжатия: {bytesIn / 1048576.0:F0} МБ → {bytesOut / 1048576.0:F0} МБ " +
                            $"(в {(double)bytesIn / Math.Max(1, bytesOut):F1} раза меньше)");
             log.Report($"Готово. Результат: {outDir}");
+            if (!missing.IsEmpty)
+            {
+                log.Report($"Картинок нет на сервере ({missing.Count}), эти товары в Excel не добавлены:");
+                foreach (var f in missing) log.Report("  " + f);
+            }
             if (!failed.IsEmpty)
             {
                 log.Report($"Не удалось скачать картинки ({failed.Count}), эти товары в Excel не добавлены:");
@@ -556,7 +603,7 @@ public static class Converter
                     cur = new Part();
                 }
 
-                cur.Rows.Add(new Row(g.Description, file, price, g.DateStart, g.DateEnd));
+                cur.Rows.Add(new Row(g.Description, file, price, g.DateStart, g.DateEnd, g.OldPrice));
                 if (cur.Images.Add(file)) cur.Bytes += size;
             }
             if (cur.Rows.Count > 0) parts.Add(cur);
@@ -621,8 +668,12 @@ public static class Converter
         {
             using var wb = new XLWorkbook();
             var ws = wb.Worksheets.Add("Лист1");
-            string[] headers = { "description", "image", "price_new", "date_start", "date_end" };
-            for (int c = 0; c < headers.Length; c++) ws.Cell(1, c + 1).Value = headers[c];
+            // Колонка price_old добавляется в конец, только если у товаров есть старая цена (YML);
+            // для JSON формат таблицы остаётся прежним
+            bool hasOld = part.Rows.Any(r => r.OldPrice.HasValue);
+            var headers = new List<string> { "description", "image", "price_new", "date_start", "date_end" };
+            if (hasOld) headers.Add("price_old");
+            for (int c = 0; c < headers.Count; c++) ws.Cell(1, c + 1).Value = headers[c];
             ws.Row(1).Style.Font.Bold = true;
 
             int row = 2;
@@ -634,6 +685,7 @@ public static class Converter
                 // Даты берём из JSON, если они там есть; иначе ячейки остаются пустыми
                 if (r.DateStart.HasValue) ws.Cell(row, 4).Value = r.DateStart.Value;
                 if (r.DateEnd.HasValue) ws.Cell(row, 5).Value = r.DateEnd.Value;
+                if (hasOld && r.OldPrice.HasValue) ws.Cell(row, 6).Value = r.OldPrice.Value;
                 row++;
             }
             ws.Column(4).Style.DateFormat.Format = "dd.mm.yyyy";
@@ -644,6 +696,7 @@ public static class Converter
             ws.Column(3).Width = 12;
             ws.Column(4).Width = 12;
             ws.Column(5).Width = 12;
+            if (hasOld) ws.Column(6).Width = 12;
             wb.SaveAs(path);
         }
 
@@ -783,8 +836,14 @@ public static class Converter
                             }
                             catch (InvalidDataException ex)
                             {
-                                failed.Add($"{pair.Key} -> {ex.Message}");   // не картинка — повторять бессмысленно
+                                missing.Add($"{pair.Key} -> {ex.Message}");   // не картинка — повторять бессмысленно
                                 break;
+                            }
+                            catch (HttpRequestException ex) when (
+                                ex.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Gone)
+                            {
+                                missing.Add($"{pair.Key} -> файла нет на сервере ({(int)ex.StatusCode!.Value})");
+                                break;                                        // 404/410 — повторы и докачка не помогут
                             }
                             catch (Exception) when (attempt < 3)
                             {
@@ -840,6 +899,107 @@ public static class Converter
                 try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
                 throw;
             }
+        }
+
+        // ---------- Чтение YML (XML) ----------
+        // Формат Яндекс.Маркета / Едадила: <offer id="..."><name/><price/><oldprice/><picture/>...</offer>.
+        // Читается потоком, по одному офферу. Магазинов и регионов в YML нет — гео задаётся в программе.
+        private (List<Group> Groups, int OffersCount, GeoModel Geo) ReadGroupsXml(string path, CancellationToken ct)
+        {
+            var list = new List<Group>();
+            var index = new Dictionary<string, Group>();
+            int count = 0, notPromo = 0, skipped = 0;
+
+            var geo = new GeoModel();
+            currentGeo = geo;
+            if (opt.RegionMode != RegionMode.Ignore || opt.ShopFilter)
+                log.Report("В YML нет данных о магазинах и регионах — разбивка по гео и фильтр по магазинам не применяются.");
+
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                                          FileOptions.SequentialScan);
+            long length = Math.Max(1, fs.Length);
+            using var reader = XmlReader.Create(fs, CreateXmlSettings());
+
+            string? shopUrl = null;
+            int nextLog = 10;
+
+            reader.MoveToContent();
+            while (!reader.EOF)
+            {
+                if (reader.NodeType == XmlNodeType.Element)
+                {
+                    // Адрес магазина нужен, чтобы достроить относительные ссылки на картинки
+                    if (reader.Depth == 2 && reader.Name == "url")
+                    {
+                        shopUrl = reader.ReadElementContentAsString().Trim();
+                        continue;
+                    }
+
+                    if (reader.Name == "offer")
+                    {
+                        var o = (XElement)XNode.ReadFrom(reader);   // после чтения reader уже стоит на следующем узле
+                        count++;
+
+                        string name = (o.Element("name")?.Value ?? "").Trim();
+                        string id = (o.Attribute("id")?.Value ?? "").Trim();
+                        string key = id.Length > 0 ? id : name;
+
+                        var price = ParseYmlPrice(o.Element("price")?.Value);
+                        var oldPrice = ParseYmlPrice(o.Element("oldprice")?.Value);
+                        bool promo = oldPrice.HasValue && oldPrice.Value > 0;
+
+                        if (key.Length == 0) skipped++;
+                        else if (opt.PromoOnly && !promo) notPromo++;       // режим «только акции»: нужен oldprice
+                        else
+                        {
+                            if (!index.TryGetValue(key, out var grp))
+                            {
+                                grp = new Group();
+                                index[key] = grp;
+                                list.Add(grp);
+                            }
+
+                            if (grp.Description.Length == 0) grp.Description = name;
+                            if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = FirstPicture(o, shopUrl);
+                            if (promo) grp.OldPrice ??= oldPrice;
+                            grp.Offers.Add(new PriceEntry(price.HasValue && price.Value > 0 ? price.Value : 0m, -1));
+                        }
+
+                        if ((count & 255) == 0)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            int p = (int)(fs.Position * 100 / length);
+                            if (p >= nextLog)
+                            {
+                                log.Report($"Чтение товаров: {p}%");
+                                nextLog = p / 10 * 10 + 10;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                reader.Read();
+            }
+
+            if (count == 0) throw new Exception("В файле нет ни одного <offer>. Это точно YML-фид?");
+            if (opt.PromoOnly)
+                log.Report($"Только акционные позиции: пропущено без oldprice — {notPromo} из {count}");
+            if (skipped > 0)
+                log.Report($"Пропущено офферов без id и названия: {skipped}");
+
+            foreach (var g in list) g.Offers.TrimExcess();
+            return (list, count, geo);
+        }
+
+        // Первая непустая картинка оффера (в YML их может быть несколько)
+        private static string? FirstPicture(XElement offer, string? shopUrl)
+        {
+            foreach (var pic in offer.Elements("picture"))
+            {
+                var url = ResolvePictureUrl(pic.Value, shopUrl);
+                if (url != null) return url;
+            }
+            return null;
         }
 
         // ---------- Чтение JSON ----------
@@ -934,9 +1094,19 @@ public static class Converter
 
             // Проход 2: офферы
             int nextLog = 10;
+            int notPromo = 0;
             bool found = ScanArray(jsonPath, "offers", o =>
             {
                 count++;
+
+                // Режим «только акции»: оффер без корректной старой цены (price_old) не учитываем совсем —
+                // ни в ценах, ни в охвате магазинов и регионов
+                if (opt.PromoOnly)
+                {
+                    var oldPrice = GetDecimal(o, "price_old");
+                    if (!(oldPrice.HasValue && oldPrice.Value > 0)) { notPromo++; return; }
+                }
+
                 string id = GetString(o, "id") ?? "";
 
                 // id вида "<код товара>_<регион/магазин>" -> ключ товара = часть до первого "_".
@@ -972,6 +1142,8 @@ public static class Converter
             });
 
             if (!found) throw new Exception("В JSON нет массива \"offers\".");
+            if (opt.PromoOnly)
+                log.Report($"Только акционные позиции: пропущено без price_old — {notPromo} из {count}");
 
             // Магазины и регионы товара считаем один раз по уникальным каталогам его офферов.
             // Учитываем только магазины и регионы, в которых реально есть товары (пустые каталоги не считаем).
@@ -992,6 +1164,116 @@ public static class Converter
     }
 
     // ======================= Вспомогательные функции =======================
+
+    /// <summary>Определяет формат по содержимому: XML (YML) начинается с «&lt;», JSON — с «{» или «[».</summary>
+    public static SourceFormat DetectFormat(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var buf = new byte[512];
+        int n = fs.Read(buf, 0, buf.Length);
+
+        // UTF-16 BOM: так бывают только XML-файлы (JSON читается как UTF-8)
+        if (n >= 2 && ((buf[0] == 0xFF && buf[1] == 0xFE) || (buf[0] == 0xFE && buf[1] == 0xFF)))
+            return SourceFormat.Xml;
+
+        int i = (n >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;   // UTF-8 BOM
+        for (; i < n; i++)
+        {
+            byte b = buf[i];
+            if (b == (byte)' ' || b == (byte)'\t' || b == (byte)'\r' || b == (byte)'\n') continue;
+            return b == (byte)'<' ? SourceFormat.Xml : SourceFormat.Json;
+        }
+        return SourceFormat.Json;
+    }
+
+    /// <summary>
+    /// Название магазина из YML (shop/name, иначе shop/company) — для имени папки результата.
+    /// Возвращает null, если файл не YML или названия в нём нет.
+    /// </summary>
+    public static string? TryReadShopName(string path)
+    {
+        try
+        {
+            if (!File.Exists(path) || DetectFormat(path) != SourceFormat.Xml) return null;
+
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var reader = XmlReader.Create(fs, CreateXmlSettings());
+            string? name = null, company = null;
+
+            reader.MoveToContent();
+            while (!reader.EOF)
+            {
+                // yml_catalog (0) > shop (1) > name / company / offers (2)
+                if (reader.NodeType == XmlNodeType.Element && reader.Depth == 2)
+                {
+                    if (reader.Name == "offers") break;                  // дальше идут только товары
+                    if (reader.Name == "name") { name = reader.ReadElementContentAsString(); continue; }
+                    if (reader.Name == "company") { company = reader.ReadElementContentAsString(); continue; }
+                }
+                reader.Read();
+            }
+
+            var result = !string.IsNullOrWhiteSpace(name) ? name : company;
+            return string.IsNullOrWhiteSpace(result) ? null : result.Trim();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static XmlReaderSettings CreateXmlSettings() => new()
+    {
+        DtdProcessing = DtdProcessing.Ignore,   // в фидах есть <!DOCTYPE ... SYSTEM "shops.dtd">: DTD не загружаем
+        XmlResolver = null,
+        IgnoreComments = true,
+        IgnoreWhitespace = true,
+        IgnoreProcessingInstructions = true,
+        CheckCharacters = false                 // «грязные» управляющие символы в фидах не должны ронять чтение
+    };
+
+    // Цена из YML: "195.9", "1 299,90", "1,299.50". Если есть и запятая, и точка, десятичный разделитель — правый.
+    private static decimal? ParseYmlPrice(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+
+        var sb = new StringBuilder(text.Length);
+        foreach (char ch in text)
+            if (!char.IsWhiteSpace(ch)) sb.Append(ch);
+        string t = sb.ToString();
+
+        int comma = t.LastIndexOf(','), dot = t.LastIndexOf('.');
+        if (comma >= 0 && dot >= 0)
+        {
+            char dec = comma > dot ? ',' : '.';
+            char thousands = dec == ',' ? '.' : ',';
+            t = t.Replace(thousands.ToString(), "").Replace(dec, '.');
+        }
+        else if (comma >= 0)
+        {
+            t = t.Replace(',', '.');
+        }
+
+        return decimal.TryParse(t, NumberStyles.AllowDecimalPoint | NumberStyles.AllowLeadingSign,
+                                CultureInfo.InvariantCulture, out var d) ? d : null;
+    }
+
+    // Ссылка на картинку: "//cdn..." -> https, относительные достраиваем по адресу магазина, иначе пропускаем
+    private static string? ResolvePictureUrl(string? pic, string? shopUrl)
+    {
+        pic = pic?.Trim();
+        if (string.IsNullOrEmpty(pic)) return null;
+        if (pic.StartsWith("//")) pic = "https:" + pic;
+
+        if (Uri.TryCreate(pic, UriKind.Absolute, out var abs))
+            return abs.Scheme == Uri.UriSchemeHttp || abs.Scheme == Uri.UriSchemeHttps ? pic : null;
+
+        if (!string.IsNullOrEmpty(shopUrl) && Uri.TryCreate(shopUrl, UriKind.Absolute, out var baseUri) &&
+            Uri.TryCreate(baseUri, pic, out var combined))
+            return combined.AbsoluteUri;
+
+        return null;
+    }
 
     // Потоковое чтение: находит в корне JSON массив с именем property и вызывает onElement для каждого
     // элемента-объекта. В памяти одновременно лежат только буфер (~1 МБ) и один элемент.
@@ -1191,6 +1473,7 @@ public static class Converter
                 first.Regions.UnionWith(g.Regions);
                 first.DateStart ??= g.DateStart;
                 first.DateEnd ??= g.DateEnd;
+                first.OldPrice ??= g.OldPrice;
             }
             else
             {

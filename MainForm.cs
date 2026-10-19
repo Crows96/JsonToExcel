@@ -4,7 +4,7 @@ public class MainForm : Form
 {
     private readonly TextBox txtJson = new()
     {
-        Dock = DockStyle.Fill, PlaceholderText = "Путь к файлу или ссылка https://... (Enter — добавить в список)"
+        Dock = DockStyle.Fill, PlaceholderText = "Путь к файлу (JSON или YML/XML) или ссылка https://... (Enter — добавить)"
     };
     private readonly Button btnJson = new() { Text = "Файлы...", AutoSize = true };
     private readonly Button btnAddLink = new() { Text = "Добавить", AutoSize = true };
@@ -43,6 +43,11 @@ public class MainForm : Form
         Text = "Считать одним товаром позиции с одинаковым названием и картинкой",
         Checked = true, AutoSize = true, Margin = new Padding(0, 4, 0, 0)
     };
+    private readonly CheckBox chkPromo = new()
+    {
+        Text = "Только акционные позиции (есть price_old — старая цена)", AutoSize = true,
+        Margin = new Padding(20, 4, 0, 0)
+    };
     private readonly CheckBox chkGeo = new()
     {
         Text = "Фильтр по магазинам (target_shops): товар минимум в", AutoSize = true, Margin = new Padding(0, 4, 4, 0)
@@ -79,7 +84,7 @@ public class MainForm : Form
 
     public MainForm()
     {
-        Text = "JSON → Excel + картинки";
+        Text = "JSON / YML → Excel + картинки";
         Width = 800;
         Height = 900;
         StartPosition = FormStartPosition.CenterScreen;
@@ -121,6 +126,7 @@ public class MainForm : Form
         var settings3 = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         settings3.Controls.Add(new Label { Text = "Макс. число товаров (0 — без ограничения):", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
         settings3.Controls.Add(numLimit);
+        settings3.Controls.Add(chkPromo);
 
         var settings4 = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         settings4.Controls.Add(chkMerge);
@@ -166,7 +172,7 @@ public class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));       // 12: прогресс
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));       // 13: лог
 
-        layout.Controls.Add(new Label { Text = "Добавить JSON:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
+        layout.Controls.Add(new Label { Text = "Добавить файл:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
         layout.Controls.Add(txtJson, 1, 0);
         layout.Controls.Add(sourceButtons, 2, 0);
 
@@ -216,7 +222,7 @@ public class MainForm : Form
         // ----- Список JSON -----
         btnJson.Click += (_, _) =>
         {
-            using var dlg = new OpenFileDialog { Filter = "JSON (*.json)|*.json|Все файлы|*.*", Multiselect = true };
+            using var dlg = new OpenFileDialog { Filter = "JSON и YML (*.json;*.xml;*.yml)|*.json;*.xml;*.yml|Все файлы|*.*", Multiselect = true };
             if (dlg.ShowDialog() != DialogResult.OK) return;
             foreach (var f in dlg.FileNames) AddSource(f);
             ApplySuggestion();
@@ -311,7 +317,7 @@ public class MainForm : Form
 
         if (!Converter.IsUrl(text) && !File.Exists(text))
         {
-            MessageBox.Show("Укажите существующий JSON-файл или ссылку (http:// или https://).", "Ошибка");
+            MessageBox.Show("Укажите существующий файл (JSON или YML/XML) или ссылку (http:// или https://).", "Ошибка");
             return false;
         }
 
@@ -322,8 +328,9 @@ public class MainForm : Form
     }
 
     // Имя для папки результата по файлу или ссылке:
-    //  - файл   -> имя файла без расширения;
-    //  - ссылка -> последняя часть ссылки (или адрес сайта).
+    //  - YML-файл -> название магазина из файла (shop/name), если оно там есть;
+    //  - файл     -> имя файла без расширения;
+    //  - ссылка   -> последняя часть ссылки (или адрес сайта).
     private static string SourceName(string source)
     {
         source = source.Trim();
@@ -341,10 +348,12 @@ public class MainForm : Form
         }
         else
         {
-            name = Path.GetFileNameWithoutExtension(source);
+            name = Converter.TryReadShopName(source) ?? Path.GetFileNameWithoutExtension(source);
         }
 
         foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
+        name = name.Trim().TrimEnd('.');
+        if (name.Length > 80) name = name[..80].TrimEnd();
         return string.IsNullOrWhiteSpace(name) ? "result" : name;
     }
 
@@ -394,7 +403,7 @@ public class MainForm : Form
         btnStart.Enabled = btnJson.Enabled = btnAddLink.Enabled = btnRemove.Enabled = btnClear.Enabled = btnOut.Enabled = !busy;
         txtJson.Enabled = lstSources.Enabled = btnRecode.Enabled = chkEconomy.Enabled = numThreads.Enabled = !busy;
         btnStop.Enabled = busy;
-        numSpread.Enabled = cmbPrice.Enabled = numPartMb.Enabled = chkZip.Enabled = numLimit.Enabled = chkMerge.Enabled = cmbRegion.Enabled = !busy;
+        numSpread.Enabled = cmbPrice.Enabled = numPartMb.Enabled = chkZip.Enabled = numLimit.Enabled = chkMerge.Enabled = chkPromo.Enabled = cmbRegion.Enabled = !busy;
         UpdateGeoControls();
     }
 
@@ -404,7 +413,7 @@ public class MainForm : Form
 
         if (lstSources.Items.Count == 0)
         {
-            MessageBox.Show("Добавьте хотя бы один JSON-файл или ссылку.", "Ошибка");
+            MessageBox.Show("Добавьте хотя бы один файл (JSON или YML/XML) или ссылку.", "Ошибка");
             return;
         }
 
@@ -435,6 +444,7 @@ public class MainForm : Form
         bool zip = chkZip.Checked;
         int limit = (int)numLimit.Value;
         bool merge = chkMerge.Checked;
+        bool promoOnly = chkPromo.Checked;
         bool shopsOn = chkGeo.Checked;
         decimal shopsPct = numGeo.Value;
         var regionMode = (RegionMode)cmbRegion.SelectedIndex;   // порядок пунктов совпадает с enum RegionMode
@@ -460,7 +470,7 @@ public class MainForm : Form
 
             items.Add(new ConvertOptions(
                 src, dir, spread, mode, partMb, zip, limit, merge, shopsOn, shopsPct, regionMode,
-                recodeOptions, threads, economy));
+                recodeOptions, threads, economy, promoOnly));
         }
 
         cts = new CancellationTokenSource();
