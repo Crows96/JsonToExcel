@@ -26,6 +26,9 @@ public enum RegionMode
     PerShop       // отдельный Excel (папка) на каждый магазин/адрес (название папки = значение из target_shops)
 }
 
+/// <summary>Один файл (или ссылка) в режиме объединения: он считается отдельным магазином.</summary>
+public sealed record FeedSource(string Source, string Label, string? Region = null);
+
 public sealed record ConvertOptions(
     string JsonSource,          // путь к файлу или ссылка
     string OutDir,
@@ -41,7 +44,8 @@ public sealed record ConvertOptions(
     RecodeOptions Recode,       // сжатие картинок
     int DownloadThreads,        // сколько картинок скачивать одновременно
     bool Economy,               // режим для слабого ПК: меньше потоков и нагрузки
-    bool PromoOnly);            // только акционные позиции: в оффере есть price_old (старая цена)
+    bool PromoOnly,             // только акционные позиции: в оффере есть price_old (старая цена)
+    IReadOnlyList<FeedSource>? Feeds = null);   // не null — режим объединения: все YML-файлы списка в один результат
 
 public static class Converter
 {
@@ -187,7 +191,18 @@ public static class Converter
 
         percent.Report(100);
         var sb = new StringBuilder();
-        sb.Append($"Обработано файлов: {ok} из {n}");
+        if (n == 1 && items[0].Feeds != null)
+        {
+            // Режим объединения: сколько файлов списка вошло в результат
+            int total = items[0].Feeds!.Count;
+            string failedPath = Path.Combine(items[0].OutDir, "failed_feeds.txt");
+            int failed = File.Exists(failedPath) ? File.ReadAllLines(failedPath).Length : 0;
+            sb.Append($"Объединено файлов (магазинов): {total - failed} из {total}");
+            if (failed > 0)
+                sb.Append($"\n⚠ Не прочитано: {failed}. Список для повторной загрузки: {failedPath}");
+        }
+        else
+            sb.Append($"Обработано файлов: {ok} из {n}");
         foreach (var e in errors) sb.Append("\n  ✗ ").Append(e);
         if (keptCache.Count > 0)
         {
@@ -302,7 +317,8 @@ public static class Converter
 
         // Общий прогресс: каждая выгрузка занимает свою долю шкалы (внутри: 0–80% скачивание, 80–99% упаковка)
         private void Pct(int local) =>
-            percent.Report(Math.Min(99, (scopeIndex * 100 + Math.Clamp(local, 0, 100)) / scopeTotal));
+            percent.Report(Math.Min(99, pctBase + (scopeIndex * 100 + Math.Clamp(local, 0, 100)) / scopeTotal * pctSpan / 100));
+        private int pctBase = 0, pctSpan = 100;
 
         private void Cleanup(bool keepCache)
         {
@@ -330,21 +346,35 @@ public static class Converter
             Directory.CreateDirectory(outDir);
             Directory.CreateDirectory(cacheDir);
 
-            // ---------- 0. Если указана ссылка — сначала скачиваем JSON ----------
-            string jsonPath = opt.JsonSource.Trim();
-            if (IsUrl(jsonPath))
-            {
-                tempJson = Path.Combine(outDir, "_source.json");
-                await DownloadJsonAsync(jsonPath, tempJson, log, ct);
-                jsonPath = tempJson;
-            }
+            List<Group> groups;
+            int offersCount;
+            GeoModel geo;
 
-            // ---------- 1. Читаем JSON и группируем записи по товару ----------
-            var format = DetectFormat(jsonPath);
-            log.Report(format == SourceFormat.Xml ? "Читаю YML (XML)..." : "Читаю JSON...");
-            var (groups, offersCount, geo) = format == SourceFormat.Xml
-                ? ReadGroupsXml(jsonPath, ct)
-                : ReadGroups(jsonPath, ct);
+            if (opt.Feeds != null)
+            {
+                // ---------- Несколько YML-файлов: каждый файл — отдельный магазин ----------
+                (groups, offersCount, geo) = await ReadGroupsFeedsAsync();
+                pctBase = 40;       // чтение файлов заняло первые 40% полосы прогресса
+                pctSpan = 60;
+            }
+            else
+            {
+                // ---------- 0. Если указана ссылка — сначала скачиваем файл ----------
+                string jsonPath = opt.JsonSource.Trim();
+                if (IsUrl(jsonPath))
+                {
+                    tempJson = Path.Combine(outDir, "_source.json");
+                    await DownloadJsonAsync(jsonPath, tempJson, log, ct);
+                    jsonPath = tempJson;
+                }
+
+                // ---------- 1. Читаем файл и группируем записи по товару ----------
+                var format = DetectFormat(jsonPath);
+                log.Report(format == SourceFormat.Xml ? "Читаю YML (XML)..." : "Читаю JSON...");
+                (groups, offersCount, geo) = format == SourceFormat.Xml
+                    ? ReadGroupsXml(jsonPath, ct)
+                    : ReadGroups(jsonPath, ct);
+            }
             GC.Collect();   // служебные структуры чтения больше не нужны
             ct.ThrowIfCancellationRequested();
             log.Report($"Записей в файле: {offersCount}, уникальных товаров: {groups.Count}");
@@ -903,17 +933,18 @@ public static class Converter
 
         // ---------- Чтение YML (XML) ----------
         // Формат Яндекс.Маркета / Едадила: <offer id="..."><name/><price/><oldprice/><picture/>...</offer>.
-        // Читается потоком, по одному офферу. Магазинов и регионов в YML нет — гео задаётся в программе.
-        private (List<Group> Groups, int OffersCount, GeoModel Geo) ReadGroupsXml(string path, CancellationToken ct)
-        {
-            var list = new List<Group>();
-            var index = new Dictionary<string, Group>();
-            int count = 0, notPromo = 0, skipped = 0;
+        // Читается потоком, по одному офферу.
+        private readonly record struct YmlOffer(string Id, string Name, string? Image, decimal Price, decimal? OldPrice);
 
-            var geo = new GeoModel();
-            currentGeo = geo;
-            if (opt.RegionMode != RegionMode.Ignore || opt.ShopFilter)
-                log.Report("В YML нет данных о магазинах и регионах — разбивка по гео и фильтр по магазинам не применяются.");
+        private sealed class YmlStats
+        {
+            public int Count, NotPromo, Skipped;
+        }
+
+        // Читает один YML-файл и вызывает onOffer для каждого подходящего оффера
+        private YmlStats ReadYmlFile(string path, Action<YmlOffer> onOffer, CancellationToken ct, Action<int>? onPercent)
+        {
+            var st = new YmlStats();
 
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
                                           FileOptions.SequentialScan);
@@ -921,7 +952,7 @@ public static class Converter
             using var reader = XmlReader.Create(fs, CreateXmlSettings());
 
             string? shopUrl = null;
-            int nextLog = 10;
+            int lastPercent = -1;
 
             reader.MoveToContent();
             while (!reader.EOF)
@@ -938,41 +969,29 @@ public static class Converter
                     if (reader.Name == "offer")
                     {
                         var o = (XElement)XNode.ReadFrom(reader);   // после чтения reader уже стоит на следующем узле
-                        count++;
+                        st.Count++;
 
                         string name = (o.Element("name")?.Value ?? "").Trim();
                         string id = (o.Attribute("id")?.Value ?? "").Trim();
-                        string key = id.Length > 0 ? id : name;
 
                         var price = ParseYmlPrice(o.Element("price")?.Value);
                         var oldPrice = ParseYmlPrice(o.Element("oldprice")?.Value);
                         bool promo = oldPrice.HasValue && oldPrice.Value > 0;
 
-                        if (key.Length == 0) skipped++;
-                        else if (opt.PromoOnly && !promo) notPromo++;       // режим «только акции»: нужен oldprice
+                        if (id.Length == 0 && name.Length == 0) st.Skipped++;
+                        else if (opt.PromoOnly && !promo) st.NotPromo++;       // режим «только акции»: нужен oldprice
                         else
-                        {
-                            if (!index.TryGetValue(key, out var grp))
-                            {
-                                grp = new Group();
-                                index[key] = grp;
-                                list.Add(grp);
-                            }
+                            onOffer(new YmlOffer(id, name, FirstPicture(o, shopUrl),
+                                                 price.HasValue && price.Value > 0 ? price.Value : 0m,
+                                                 promo ? oldPrice : null));
 
-                            if (grp.Description.Length == 0) grp.Description = name;
-                            if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = FirstPicture(o, shopUrl);
-                            if (promo) grp.OldPrice ??= oldPrice;
-                            grp.Offers.Add(new PriceEntry(price.HasValue && price.Value > 0 ? price.Value : 0m, -1));
-                        }
-
-                        if ((count & 255) == 0)
+                        if ((st.Count & 255) == 0)
                         {
                             ct.ThrowIfCancellationRequested();
-                            int p = (int)(fs.Position * 100 / length);
-                            if (p >= nextLog)
+                            if (onPercent != null)
                             {
-                                log.Report($"Чтение товаров: {p}%");
-                                nextLog = p / 10 * 10 + 10;
+                                int p = (int)(fs.Position * 100 / length);
+                                if (p != lastPercent) { lastPercent = p; onPercent(p); }
                             }
                         }
                         continue;
@@ -980,15 +999,203 @@ public static class Converter
                 }
                 reader.Read();
             }
+            return st;
+        }
 
-            if (count == 0) throw new Exception("В файле нет ни одного <offer>. Это точно YML-фид?");
+        // Добавляет оффер в группу товара (создаёт группу при необходимости); cat — код каталога/файла (-1 — нет)
+        private static void AddYmlToGroups(List<Group> list, Dictionary<string, Group> index, string key, YmlOffer o, int cat)
+        {
+            if (!index.TryGetValue(key, out var grp))
+            {
+                grp = new Group();
+                index[key] = grp;
+                list.Add(grp);
+            }
+
+            if (grp.Description.Length == 0) grp.Description = o.Name;
+            if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = o.Image;
+            if (o.OldPrice.HasValue) grp.OldPrice ??= o.OldPrice;
+            grp.Offers.Add(new PriceEntry(o.Price, cat));
+        }
+
+        // Один YML-файл: магазинов и регионов в нём нет — гео задаётся в программе.
+        private (List<Group> Groups, int OffersCount, GeoModel Geo) ReadGroupsXml(string path, CancellationToken ct)
+        {
+            var list = new List<Group>();
+            var index = new Dictionary<string, Group>();
+
+            var geo = new GeoModel();
+            currentGeo = geo;
+            if (opt.RegionMode != RegionMode.Ignore || opt.ShopFilter)
+                log.Report("В YML нет данных о магазинах и регионах — разбивка по гео и фильтр по магазинам не применяются.");
+
+            int nextLog = 10;
+            var st = ReadYmlFile(path,
+                o => AddYmlToGroups(list, index, o.Id.Length > 0 ? o.Id : o.Name, o, -1),
+                ct,
+                p =>
+                {
+                    if (p >= nextLog)
+                    {
+                        log.Report($"Чтение товаров: {p}%");
+                        nextLog = p / 10 * 10 + 10;
+                    }
+                });
+
+            if (st.Count == 0) throw new Exception("В файле нет ни одного <offer>. Это точно YML-фид?");
             if (opt.PromoOnly)
-                log.Report($"Только акционные позиции: пропущено без oldprice — {notPromo} из {count}");
-            if (skipped > 0)
-                log.Report($"Пропущено офферов без id и названия: {skipped}");
+                log.Report($"Только акционные позиции: пропущено без oldprice — {st.NotPromo} из {st.Count}");
+            if (st.Skipped > 0)
+                log.Report($"Пропущено офферов без id и названия: {st.Skipped}");
 
             foreach (var g in list) g.Offers.TrimExcess();
-            return (list, count, geo);
+            return (list, st.Count, geo);
+        }
+
+        // Несколько YML-файлов в один результат: каждый файл — отдельный магазин (как каталог в JSON).
+        // Дальше работают обычные механизмы: охват магазинов, разброс цен, один общий Excel и один набор картинок.
+        private async Task<(List<Group> Groups, int OffersCount, GeoModel Geo)> ReadGroupsFeedsAsync()
+        {
+            var feeds = opt.Feeds!;
+            var list = new List<Group>();
+            var index = new Dictionary<string, Group>();
+
+            var geo = new GeoModel();
+            currentGeo = geo;
+            var shopIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var regionIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var catShops = new List<int[]>();
+            var catRegions = new List<int[]>();
+            var usedLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var failedFeeds = new List<string>();
+
+            string tmpFeed = Path.Combine(outDir, "_feed.tmp");
+            tempJson = tmpFeed;                      // Cleanup удалит временный файл при любом исходе
+
+            int total = feeds.Count, okFeeds = 0, totalOffers = 0, totalNotPromo = 0;
+            log.Report($"Режим объединения: каждый файл — отдельный магазин, файлов в списке: {total}");
+
+            for (int i = 0; i < total; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var feed = feeds[i];
+                percent.Report(Math.Min(39, i * 40 / total));
+
+                // Название магазина должно быть уникальным, иначе два файла склеятся в один магазин
+                string label = string.IsNullOrWhiteSpace(feed.Label) ? $"feed_{i + 1}" : feed.Label.Trim();
+                string unique = label;
+                int k = 2;
+                while (!usedLabels.Add(unique)) unique = $"{label} ({k++})";
+
+                // Товары файла собираем отдельно и добавляем в общий набор только если файл прочитан целиком
+                var buffer = new List<(string Key, YmlOffer Offer)>();
+                YmlStats? st = null;
+                try
+                {
+                    string path = feed.Source.Trim();
+                    if (IsUrl(path))
+                    {
+                        for (int attempt = 1; ; attempt++)
+                        {
+                            try
+                            {
+                                await DownloadJsonAsync(path, tmpFeed, log, ct, quiet: true);
+                                break;
+                            }
+                            catch (Exception) when (attempt < 3 && !ct.IsCancellationRequested)
+                            {
+                                await Task.Delay(1000 * attempt, ct);
+                            }
+                        }
+                        path = tmpFeed;
+                    }
+                    else if (!File.Exists(path))
+                    {
+                        throw new FileNotFoundException("файл не найден");
+                    }
+
+                    if (DetectFormat(path) != SourceFormat.Xml)
+                        throw new InvalidDataException("в режиме объединения поддерживаются только YML/XML-файлы");
+
+                    st = ReadYmlFile(path, o =>
+                    {
+                        // Один и тот же товар в разных магазинах: совпадают id и название
+                        string key = o.Id.Length > 0 ? o.Id + "\u0001" + NormalizeText(o.Name) : NormalizeText(o.Name);
+                        buffer.Add((key, o));
+                    }, ct, null);
+
+                    if (st.Count == 0) throw new InvalidDataException("в файле нет офферов");
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    log.Report($"[{i + 1}/{total}] {unique}: ПРОПУЩЕН — {ex.Message}");
+                    failedFeeds.Add(feed.Region == null ? $"{feed.Source};{feed.Label}" : $"{feed.Source};{feed.Label};{feed.Region}");
+                    usedLabels.Remove(unique);
+                    continue;
+                }
+                finally
+                {
+                    try { if (File.Exists(tmpFeed)) File.Delete(tmpFeed); } catch { }
+                }
+
+                // Файл прочитан: это новый «каталог» с одним магазином (и, если задан, регионом)
+                int cat = catShops.Count;
+                int shop = Intern(shopIndex, geo.ShopNames, unique);
+                var regions = new HashSet<int>();
+                if (!string.IsNullOrWhiteSpace(feed.Region))
+                    regions.Add(Intern(regionIndex, geo.RegionNames, feed.Region.Trim()));
+
+                catShops.Add(new[] { shop });
+                catRegions.Add(regions.ToArray());
+                foreach (var r in regions)
+                {
+                    if (!geo.RegionShops.TryGetValue(r, out var rs)) geo.RegionShops[r] = rs = new HashSet<int>();
+                    rs.Add(shop);
+                }
+
+                foreach (var (key, offer) in buffer) AddYmlToGroups(list, index, key, offer, cat);
+
+                okFeeds++;
+                totalOffers += st!.Count;
+                totalNotPromo += st.NotPromo;
+                log.Report($"[{i + 1}/{total}] {unique}: товаров {st.Count}");
+
+                if (opt.Economy && (i & 31) == 31) GC.Collect();   // слабый ПК: не даём куче разрастаться
+            }
+
+            if (okFeeds == 0) throw new Exception("Ни один файл списка не удалось прочитать.");
+
+            if (failedFeeds.Count > 0)
+            {
+                string failedPath = Path.Combine(outDir, "failed_feeds.txt");
+                File.WriteAllLines(failedPath, failedFeeds);
+                log.Report($"⚠ Не прочитано файлов: {failedFeeds.Count} из {total}. Они не участвуют в охвате магазинов. " +
+                           $"Список для повторной загрузки: {failedPath}");
+            }
+            if (opt.PromoOnly)
+                log.Report($"Только акционные позиции: пропущено без oldprice — {totalNotPromo} из {totalOffers}");
+            log.Report($"Прочитано файлов (магазинов): {okFeeds}, уникальных товаров: {list.Count}");
+
+            // Магазины и регионы товара: по файлам, в которых он встретился
+            geo.CatShops = catShops.ToArray();
+            geo.CatRegions = catRegions.ToArray();
+            foreach (var g in list)
+            {
+                ct.ThrowIfCancellationRequested();
+                var seen = new HashSet<int>();
+                foreach (var e in g.Offers)
+                    if (e.Cat != -1 && seen.Add(e.Cat)) AddGeo(g, geo, e.Cat);
+
+                g.Offers.TrimExcess();
+                geo.UsedShops.UnionWith(g.Shops);
+                geo.UsedRegions.UnionWith(g.Regions);
+            }
+
+            return (list, totalOffers, geo);
         }
 
         // Первая непустая картинка оффера (в YML их может быть несколько)
@@ -1410,9 +1617,9 @@ public static class Converter
         return h;
     }
 
-    private static async Task DownloadJsonAsync(string url, string path, IProgress<string> log, CancellationToken ct)
+    private static async Task DownloadJsonAsync(string url, string path, IProgress<string> log, CancellationToken ct, bool quiet = false)
     {
-        log.Report("Скачиваю JSON по ссылке...");
+        if (!quiet) log.Report("Скачиваю JSON по ссылке...");
         var handler = new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.All };
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(15) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0");
@@ -1435,10 +1642,10 @@ public static class Converter
                 if (total - lastLogged >= 10L * 1024 * 1024)
                 {
                     lastLogged = total;
-                    log.Report($"JSON: скачано {total / 1024.0 / 1024.0:F0} МБ...");
+                    if (!quiet) log.Report($"JSON: скачано {total / 1024.0 / 1024.0:F0} МБ...");
                 }
             }
-            log.Report($"JSON скачан: {total / 1024.0 / 1024.0:F1} МБ");
+            if (!quiet) log.Report($"JSON скачан: {total / 1024.0 / 1024.0:F1} МБ");
         }
         catch (Exception ex) when (!ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException or IOException)
         {
