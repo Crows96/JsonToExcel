@@ -25,7 +25,7 @@ public class MainForm : Form
     private readonly Button btnClear = new() { Text = "Очистить", AutoSize = true };
     private readonly CheckBox chkCombine = new()
     {
-        Text = "Объединить все файлы очереди в один результат: каждый файл — отдельный магазин (только YML/XML)",
+        Text = "Объединить все файлы очереди в один результат (YML/XML и JSON)",
         AutoSize = true, Margin = new Padding(0, 4, 0, 4)
     };
     private readonly TextBox txtOut = new() { Dock = DockStyle.Fill };
@@ -56,6 +56,11 @@ public class MainForm : Form
         Text = "Считать одним товаром позиции с одинаковым названием и картинкой",
         Checked = true, AutoSize = true, Margin = new Padding(0, 4, 0, 0)
     };
+    private readonly CheckBox chkSubject = new()
+    {
+        Text = "Регионом считать субъект РФ (область, край, республика), а не город", AutoSize = true,
+        Margin = new Padding(3, 4, 3, 2)
+    };
     private readonly CheckBox chkPromo = new()
     {
         Text = "Только акционные позиции (есть price_old — старая цена)", AutoSize = true,
@@ -72,6 +77,10 @@ public class MainForm : Form
     private readonly ComboBox cmbRegion = new()
     {
         DropDownStyle = ComboBoxStyle.DropDownList, Width = 480, Margin = new Padding(0, 3, 0, 0)
+    };
+    private readonly Label lblRegionHint = new()
+    {
+        AutoSize = true, MaximumSize = new Size(700, 0), ForeColor = SystemColors.GrayText, Margin = new Padding(3, 6, 3, 2)
     };
     private readonly Label lblRecode = new() { AutoSize = true, Margin = new Padding(0, 6, 10, 0) };
     private readonly Button btnRecode = new() { Text = "Настроить...", AutoSize = true };
@@ -125,12 +134,14 @@ public class MainForm : Form
         // Порядок пунктов совпадает с enum RegionMode
         cmbRegion.Items.AddRange(new object[]
         {
-            "Не разбивать (один Excel на весь файл)",
-            "Один Excel: только товары, которые есть во всех регионах (target_regions)",
-            "Отдельный Excel (папка) на каждый регион (target_regions)",
-            "Отдельный Excel (папка) на каждый магазин / адрес (target_shops)"
+            "Не разбивать — один Excel на все магазины",
+            "Только товары, которые есть во всех регионах — один Excel",
+            "По регионам — отдельный Excel (папка) на каждый регион / город",
+            "По магазинам — отдельный Excel (папка) на каждый магазин",
+            "По регионам, но один общий Excel — фильтр считается в каждом регионе отдельно"
         });
         cmbRegion.SelectedIndex = 0;
+        UpdateRegionHint();
 
         UpdateRecodeLabel();
 
@@ -192,9 +203,13 @@ public class MainForm : Form
                                 "Название и регион необязательны.");
         tip.SetToolTip(btnAddLink, "Добавить в очередь то, что набрано в поле слева.");
         tip.SetToolTip(lstSources, "Очередь обработки. Файлы обрабатываются по очереди.");
-        tip.SetToolTip(chkCombine, "Все файлы очереди считаются одним набором: каждый файл — это один магазин. В результат попадут " +
-                                   "товары, которые повторяются в нужном проценте магазинов. Получится один Excel и один набор картинок. " +
-                                   "Подходит для YML/XML.");
+        tip.SetToolTip(chkSubject, "Если включено, регион определяется по справочнику: город из адреса магазина заменяется его областью, краем или республикой " +
+                                   "(Химки и Мытищи — «Московская область», Зеленоград — «Москва»), а названия из target_regions приводятся к официальным. " +
+                                   "Если выключено, регионом остаётся город из адреса. Нужен встроенный справочник ru_geo.tsv.");
+        tip.SetToolTip(chkCombine, "Все файлы очереди считаются одним набором. В YML каждый файл — один магазин. В JSON магазины берутся " +
+                                   "из target_shops внутри файлов; если один и тот же магазин встретился в нескольких файлах, он " +
+                                   "учитывается один раз, а один и тот же товар — тоже один раз. В результат попадут товары, которые " +
+                                   "повторяются в нужном проценте магазинов. Получится один Excel (или несколько частей, если картинок много).");
         tip.SetToolTip(txtOut, "Папка, куда будут сохранены результаты. По умолчанию — рядом с файлом.");
         tip.SetToolTip(chkPromo, "Берём только акционные товары — те, у которых указана старая цена.");
         tip.SetToolTip(chkGeo, "Оставляем только товары, которые есть минимум в указанном проценте магазинов. Например, 80 — товар должен " +
@@ -205,7 +220,7 @@ public class MainForm : Form
                                   "Пример: 5 — цены 100 и 104 подходят, 100 и 110 — нет.");
         tip.SetToolTip(cmbPrice, "Если у товара несколько цен (в разных магазинах), какую из них записать в Excel.");
         tip.SetToolTip(cmbRegion, "Как разделить результат: один общий Excel, Excel только с товарами, которые есть во всех регионах, " +
-                                  "или отдельная папка на каждый регион или магазин. Названия берутся из target_regions и target_shops.");
+                                  "или отдельная папка на каждый регион или магазин. Названия берутся из target_regions и target_shops. Если в файле нет target_regions, регион определяется как город из адреса магазина.");
         tip.SetToolTip(btnRecode, "Уменьшить и пережать картинки при скачивании: файлы становятся в разы легче, частей получается меньше.");
         tip.SetToolTip(numPartMb, "Результат делится на части (part_001, part_002...), чтобы архивы с картинками не были слишком большими. " +
                                   "Здесь — максимальный размер картинок в одной части.");
@@ -231,8 +246,13 @@ public class MainForm : Form
             RowOf(chkGeo, numGeo, Caption("% магазинов", "Минимальный процент магазинов, в которых должен быть товар.")),
             RowOf(Caption("Допустимая разница цен между магазинами, %:", "0 — цена должна совпадать. Пример: 5 — цены 100 и 104 подходят, 100 и 110 нет."),
                   numSpread),
-            RowOf(Caption("Какую цену записать в Excel:", "Если у товара несколько цен, какую из них записать."), cmbPrice),
-            RowOf(Caption("Как разбить результат:", "Один общий Excel или отдельные папки по регионам и магазинам."), cmbRegion));
+            RowOf(Caption("Какую цену записать в Excel:", "Если у товара несколько цен, какую из них записать."), cmbPrice));
+
+        // Отдельный заметный блок: для больших фидов по всей стране именно здесь выбирается «по регионам»
+        var regionGroup = Group("Разбивка по регионам и магазинам",
+            RowOf(Caption("Как разбить результат:", "Один общий Excel или отдельные папки по регионам и магазинам."), cmbRegion),
+            lblRegionHint,
+            chkSubject);
 
         var imagesGroup = Group("Картинки",
             RowOf(Caption("Сжатие:", "Уменьшение и пережатие картинок при скачивании."), lblRecode, btnRecode),
@@ -287,6 +307,7 @@ public class MainForm : Form
 
         AddWide(presetRow, new RowStyle(SizeType.AutoSize));
         AddWide(productsGroup, new RowStyle(SizeType.AutoSize));
+        AddWide(regionGroup, new RowStyle(SizeType.AutoSize));
         AddWide(imagesGroup, new RowStyle(SizeType.AutoSize));
         AddWide(btnAdvanced, new RowStyle(SizeType.AutoSize));
         AddWide(advancedPanel, new RowStyle(SizeType.AutoSize));
@@ -423,9 +444,10 @@ public class MainForm : Form
         cmbRegion.SelectedIndexChanged += (_, _) =>
         {
             // Для режимов по регионам охват считается по объединённым товарам; для магазинов объединение не обязательно
-            if (!applying && cmbRegion.SelectedIndex is (int)RegionMode.AllRegions or (int)RegionMode.PerRegion)
+            if (!applying && cmbRegion.SelectedIndex is (int)RegionMode.AllRegions or (int)RegionMode.PerRegion or (int)RegionMode.RegionsMerged)
                 chkMerge.Checked = true;
             UpdateGeoControls();
+            UpdateRegionHint();
         };
 
         // Режим для слабого ПК: меньше одновременных скачиваний (число можно поправить вручную)
@@ -466,6 +488,15 @@ public class MainForm : Form
         return many;
     }
 
+    // Есть ли в очереди JSON (локальные файлы определяются по содержимому, ссылки — по расширению)
+    private bool QueueHasJson() =>
+        lstSources.Items.Cast<SourceItem>().Any(s =>
+        {
+            if (Converter.IsUrl(s.Source)) return s.Source.Contains(".json", StringComparison.OrdinalIgnoreCase);
+            try { return File.Exists(s.Source) && Converter.DetectFormat(s.Source) == SourceFormat.Json; }
+            catch { return false; }
+        });
+
     // Простыми словами описывает, что произойдёт при нажатии «Старт»
     private void UpdateSummary()
     {
@@ -479,7 +510,10 @@ public class MainForm : Form
 
         if (n == 0) lines.Add("Добавьте в очередь файлы или ссылки (JSON, YML/XML).");
         else if (combine && n < 2) lines.Add("⚠ Для объединения добавьте в очередь минимум два файла.");
-        else if (combine) lines.Add($"Файлов в очереди: {n}. Из них будет собран один результат: каждый файл — отдельный магазин.");
+        else if (combine) lines.Add($"Файлов в очереди: {n}. Из них будет собран один результат. " +
+                                    (QueueHasJson()
+                                        ? "Магазины берутся из самих JSON-файлов (target_shops); повторяющиеся магазины и товары учитываются один раз."
+                                        : "Каждый файл — отдельный магазин."));
         else if (n == 1) lines.Add("Будет обработан один файл, результат — в выбранной папке.");
         else lines.Add($"Файлов в очереди: {n}. Каждый обрабатывается отдельно и получает свою папку.");
 
@@ -488,16 +522,21 @@ public class MainForm : Form
             : "Берутся все позиции, не только акционные.");
 
         if (geoMode == (int)RegionMode.AllRegions)
-            lines.Add("Остаются только товары, которые есть во всех регионах (target_regions).");
+            lines.Add("Остаются только товары, которые есть во всех регионах (target_regions; если их нет — город из адреса магазина).");
         else if (geoMode == (int)RegionMode.PerRegion)
-            lines.Add("Для каждого региона (target_regions) создаётся своя папка с Excel.");
+            lines.Add("Для каждого региона (target_regions; если их нет — город из адреса магазина) создаётся своя папка с Excel.");
+        else if (geoMode == (int)RegionMode.RegionsMerged)
+            lines.Add("Фильтр считается в каждом регионе отдельно (регион — target_regions или город из адреса), результат — один общий Excel.");
         else if (perShop)
             lines.Add("Для каждого магазина или адреса (target_shops) создаётся своя папка с Excel.");
 
         if (shopFilter)
         {
             decimal pct = numGeo.Value;
-            if (combine && n >= 2)
+            if (combine && n >= 2 && QueueHasJson())
+                lines.Add($"Товар должен быть минимум в {pct:0.##}% магазинов из всех файлов. Сколько их всего, программа посчитает " +
+                          "при проверке файлов перед чтением и покажет в журнале.");
+            else if (combine && n >= 2)
             {
                 int need = (int)Math.Ceiling(n * pct / 100m);
                 lines.Add($"Товар должен быть минимум в {pct:0.##}% магазинов — то есть в {need} из {n}.");
@@ -549,6 +588,7 @@ public class MainForm : Form
         ShopFilter = chkGeo.Checked,
         ShopPercent = numGeo.Value,
         GeoMode = Math.Max(0, cmbRegion.SelectedIndex),
+        RegionBySubject = chkSubject.Checked,
         Combine = chkCombine.Checked,
         Economy = chkEconomy.Checked,
         Threads = (int)numThreads.Value,
@@ -574,6 +614,7 @@ public class MainForm : Form
             chkGeo.Checked = s.ShopFilter;
             numGeo.Value = Math.Clamp(s.ShopPercent, numGeo.Minimum, numGeo.Maximum);
             cmbRegion.SelectedIndex = Math.Clamp(s.GeoMode, 0, cmbRegion.Items.Count - 1);
+            chkSubject.Checked = s.RegionBySubject;
             chkCombine.Checked = s.Combine;
             chkEconomy.Checked = s.Economy;
             numThreads.Value = Math.Clamp(s.Threads, 1, 64);
@@ -796,6 +837,29 @@ public class MainForm : Form
     {
         bool perShop = cmbRegion.SelectedIndex == (int)RegionMode.PerShop;
         chkGeo.Enabled = numGeo.Enabled = !isBusy && !perShop;
+        chkSubject.Enabled = !isBusy && cmbRegion.SelectedIndex is (int)RegionMode.AllRegions or (int)RegionMode.PerRegion or (int)RegionMode.RegionsMerged;
+    }
+
+    // Короткое пояснение под выбором разбивки: что будет сделано в выбранном режиме
+    private void UpdateRegionHint()
+    {
+        lblRegionHint.Text = (RegionMode)Math.Max(0, cmbRegion.SelectedIndex) switch
+        {
+            RegionMode.AllRegions =>
+                "Остаются только товары, которые есть в каждом регионе. Регион — это target_regions, а если их в файле нет — город из адреса магазина (target_shops).",
+            RegionMode.PerRegion =>
+                "Для каждого региона создаётся своя папка с Excel. Регион — это target_regions, а если их в файле нет — город из адреса магазина (target_shops). " +
+                "Процент магазинов и разброс цен считаются внутри региона. Рекомендуется для больших фидов по всей стране.",
+            RegionMode.PerShop =>
+                "Для каждого магазина (адреса) создаётся своя папка с Excel. Фильтр по проценту магазинов не применяется.",
+            RegionMode.RegionsMerged =>
+                "Результат — один Excel. Процент магазинов и разброс цен проверяются в каждом регионе отдельно (регион — это target_regions, " +
+                "а если их нет — город из адреса магазина). В файл попадает товар, который прошёл проверку в каждом регионе, где он есть. " +
+                "Цена берётся по всем магазинам по правилу «Какую цену записать».",
+            _ =>
+                "Все магазины считаются вместе. Для фида по всей стране процент магазинов считается от всех магазинов сразу, " +
+                "поэтому товаров может остаться мало — для таких фидов выберите «По регионам»."
+        };
     }
 
     private void SetBusy(bool busy)
@@ -835,16 +899,6 @@ public class MainForm : Form
             if (sources.Count < 2)
             {
                 MessageBox.Show("Для объединения нужно минимум два файла в очереди.", "Ошибка");
-                return;
-            }
-
-            // Локальные файлы проверяем сразу; ссылки проверит сама программа при скачивании
-            var notYml = sources.Where(s => !Converter.IsUrl(s.Source) && Converter.DetectFormat(s.Source) != SourceFormat.Xml)
-                                .Select(s => s.Source).ToList();
-            if (notYml.Count > 0)
-            {
-                MessageBox.Show("В режиме объединения поддерживаются только YML/XML-файлы. Не подходят:\n" +
-                                string.Join("\n", notYml.Take(8)), "Ошибка");
                 return;
             }
         }
@@ -888,7 +942,7 @@ public class MainForm : Form
                 .ToList();
             items.Add(new ConvertOptions(
                 sources[0].Source, baseDir, spread, mode, partMb, zip, limit, merge, shopsOn, shopsPct, regionMode,
-                recodeOptions, threads, economy, promoOnly, feeds));
+                recodeOptions, threads, economy, promoOnly, feeds, chkSubject.Checked));
         }
         else
         {
@@ -908,7 +962,7 @@ public class MainForm : Form
 
                 items.Add(new ConvertOptions(
                     src.Source, dir, spread, mode, partMb, zip, limit, merge, shopsOn, shopsPct, regionMode,
-                    recodeOptions, threads, economy, promoOnly));
+                    recodeOptions, threads, economy, promoOnly, null, chkSubject.Checked));
             }
         }
 
@@ -941,7 +995,10 @@ public class MainForm : Form
         }
         catch (Exception ex)
         {
+            // Полоса убирается (сбрасывается), и строка в журнале говорит, что программа остановилась
+            progress.Value = 0;
             log.AppendText("ОШИБКА: " + ex.Message + Environment.NewLine);
+            log.AppendText("■ Программа остановлена, больше ничего не выполняется. Измените настройки и запустите снова." + Environment.NewLine);
             MessageBox.Show(ex.Message, "Ошибка");
         }
         finally

@@ -23,10 +23,11 @@ public enum RegionMode
     Ignore,       // регионы не учитываем
     AllRegions,   // один Excel: только товары, которые есть во всех регионах
     PerRegion,    // отдельный Excel (папка) на каждый регион (название папки = значение из target_regions)
-    PerShop       // отдельный Excel (папка) на каждый магазин/адрес (название папки = значение из target_shops)
+    PerShop,      // отдельный Excel (папка) на каждый магазин/адрес (название папки = значение из target_shops)
+    RegionsMerged // один Excel: охват и цены считаются в каждом регионе отдельно; товар берём, если прошёл фильтр в каждом регионе, где он есть
 }
 
-/// <summary>Один файл (или ссылка) в режиме объединения: он считается отдельным магазином.</summary>
+/// <summary>Один файл (или ссылка) в режиме объединения. YML — отдельный магазин; в JSON магазины берутся из каталогов (target_shops).</summary>
 public sealed record FeedSource(string Source, string Label, string? Region = null);
 
 public sealed record ConvertOptions(
@@ -45,7 +46,8 @@ public sealed record ConvertOptions(
     int DownloadThreads,        // сколько картинок скачивать одновременно
     bool Economy,               // режим для слабого ПК: меньше потоков и нагрузки
     bool PromoOnly,             // только акционные позиции: в оффере есть price_old (старая цена)
-    IReadOnlyList<FeedSource>? Feeds = null);   // не null — режим объединения: все YML-файлы списка в один результат
+    IReadOnlyList<FeedSource>? Feeds = null,   // не null — режим объединения: все файлы списка (YML и/или JSON) в один результат
+    bool RegionBySubject = false);             // регион = субъект РФ (область, край, республика) по справочнику, а не город
 
 public static class Converter
 {
@@ -92,6 +94,7 @@ public static class Converter
         public string Kind = "Регион";                  // подпись для лога: «Регион» / «Магазин»
         public List<Group> Candidates = new();
         public HashSet<int> ShopSet = new();            // магазины, по которым считаем охват
+        public List<(Group Group, decimal Price)>? Preselected;   // отбор уже сделан (режим «по регионам, один Excel»)
     }
 
     private sealed class SelStats
@@ -197,7 +200,7 @@ public static class Converter
             int total = items[0].Feeds!.Count;
             string failedPath = Path.Combine(items[0].OutDir, "failed_feeds.txt");
             int failed = File.Exists(failedPath) ? File.ReadAllLines(failedPath).Length : 0;
-            sb.Append($"Объединено файлов (магазинов): {total - failed} из {total}");
+            sb.Append($"Объединено файлов: {total - failed} из {total}");
             if (failed > 0)
                 sb.Append($"\n⚠ Не прочитано: {failed}. Список для повторной загрузки: {failedPath}");
         }
@@ -392,13 +395,9 @@ public static class Converter
 
             // ---------- 2. Выгрузки: весь файл / один Excel на все регионы / Excel на каждый регион ----------
             var scopes = BuildScopes(groups, geo);
+            scopeCount = scopes.Count;
             if (scopes.Count == 0)
-            {
-                log.Report("Нет товаров для выгрузки.");
-                Cleanup(false);
-                percent.Report(100);
-                return outDir;
-            }
+                throw new InvalidOperationException("Нет товаров для выгрузки: ни один товар не подошёл под выбранный режим. Причины — в журнале выше.");
 
             scopeTotal = scopes.Count;
             for (scopeIndex = 0; scopeIndex < scopes.Count; scopeIndex++)
@@ -436,7 +435,7 @@ public static class Converter
             var scopes = new List<Scope>();
             var mode = opt.RegionMode;
 
-            if ((mode == RegionMode.AllRegions || mode == RegionMode.PerRegion) && geo.UsedRegions.Count == 0)
+            if ((mode == RegionMode.AllRegions || mode == RegionMode.PerRegion || mode == RegionMode.RegionsMerged) && geo.UsedRegions.Count == 0)
             {
                 log.Report("В файле нет регионов (target_regions / region) — режим регионов не применяется.");
                 mode = RegionMode.Ignore;
@@ -490,6 +489,65 @@ public static class Converter
                     log.Report($"Режим регионов: отдельный Excel на каждый регион — регионов: {scopes.Count}");
                     break;
                 }
+                case RegionMode.RegionsMerged:
+                {
+                    // Каждый регион проверяем отдельно: процент магазинов считается среди магазинов этого региона,
+                    // разброс цен — среди цен этого региона. Товар попадает в общий Excel, если прошёл проверку
+                    // в каждом регионе, где он есть. Цену для Excel выбираем по всем его офферам (режим цены из настроек).
+                    log.Report($"Режим регионов: один общий Excel, фильтр считается в каждом регионе отдельно — регионов: {geo.UsedRegions.Count}");
+                    var failedGroups = new HashSet<Group>();
+                    foreach (int r in geo.UsedRegions.OrderBy(x => x))
+                    {
+                        var cand = groups.Where(g => g.Regions.Contains(r)).ToList();
+                        if (cand.Count == 0) continue;
+
+                        var shopSet = new HashSet<int>();
+                        if (geo.RegionShops.TryGetValue(r, out var rs))
+                            foreach (var sh in rs)
+                                if (geo.UsedShops.Contains(sh)) shopSet.Add(sh);
+
+                        bool useShops = opt.ShopFilter && shopSet.Count > 1;
+                        int need = useShops ? Math.Max(1, (int)Math.Ceiling(shopSet.Count * opt.ShopPercent / 100m)) : 0;
+                        var sub = new Scope { Title = geo.RegionNames[r], Region = r, Candidates = cand, ShopSet = shopSet };
+                        var (sel, _) = SelectProducts(sub, useShops, need);
+
+                        var pass = new HashSet<Group>(sel.Select(x => x.Group));
+                        foreach (var g in cand)
+                            if (!pass.Contains(g)) failedGroups.Add(g);
+
+                        log.Report($"  {geo.RegionNames[r]}: магазинов {shopSet.Count}, товаров {cand.Count}, прошло {pass.Count}" +
+                                   (useShops ? $" (нужно минимум в {need} магазинах)" : ""));
+                    }
+
+                    var allScope = new Scope();     // без региона и магазина: цены всех офферов
+                    var final = new List<(Group Group, decimal Price)>();
+                    int noRegion = 0;
+                    foreach (var g in groups)
+                    {
+                        if (g.Regions.Count == 0) { noRegion++; continue; }
+                        if (failedGroups.Contains(g)) continue;
+                        var prices = ScopePrices(g, allScope);
+                        if (prices.Count == 0) continue;
+                        final.Add((g, PickPrice(prices, opt.PriceMode)));
+                    }
+
+                    log.Report($"Итого в общем Excel: {final.Count} товаров. Отсеяно из-за регионов: {failedGroups.Count}" +
+                               (noRegion > 0 ? $", без региона: {noRegion}" : ""));
+                    if (final.Count == 0)
+                    {
+                        log.Report("Ни один товар не прошёл проверку во всех регионах, где он есть. " +
+                                   "Уменьшите процент магазинов или увеличьте допустимую разницу цен.");
+                        return scopes;
+                    }
+                    scopes.Add(new Scope
+                    {
+                        Dir = outDir,
+                        Candidates = final.Select(x => x.Group).ToList(),
+                        ShopSet = geo.UsedShops,
+                        Preselected = final
+                    });
+                    break;
+                }
                 case RegionMode.PerShop:
                 {
                     var usedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -531,7 +589,7 @@ public static class Converter
             // --- Отбор: охват по магазинам и разброс цен ---
             bool useShops = false;
             int needShops = 0;
-            if (opt.ShopFilter && scope.Shop < 0)   // в выгрузке одного магазина охват по магазинам не нужен
+            if (opt.ShopFilter && scope.Shop < 0 && scope.Preselected == null)   // в выгрузке одного магазина охват не нужен; в «регионах в один Excel» отбор уже сделан
             {
                 if (scope.ShopSet.Count > 1)
                 {
@@ -541,32 +599,54 @@ public static class Converter
                 else L("Магазины (target_shops) не заданы или магазин один — фильтр по магазинам не применён.");
             }
 
+            bool tableShown = false;
+            if (useShops && scopeCount <= 3)
+            {
+                LogCoverageTable(scope, needShops, L);
+                tableShown = true;
+            }
+
             var (selected, st) = SelectProducts(scope, useShops, needShops);
 
             if (useShops && selected.Count == 0)
             {
+                if (!tableShown) LogCoverageTable(scope, needShops, L);
+                // Ничего не подошло: не подставляем «все товары» и ничего не скачиваем, а останавливаемся с понятной ошибкой
                 int best = scope.Candidates.Count == 0 ? 0 : scope.Candidates.Max(g => CountIn(g.Shops, scope.ShopSet));
-                L($"Ни один товар не встречается минимум в {opt.ShopPercent}% магазинов ({needShops} из {scope.ShopSet.Count}); " +
-                  $"максимальный охват — {best}. Чтобы не получить пустой Excel, беру товары без фильтра по магазинам.");
-                useShops = false;
-                (selected, st) = SelectProducts(scope, false, 0);
+                string where = scope.Title.Length > 0 ? $" ({scope.Kind}: {scope.Title})" : "";
+                if (st.ShopDropped == scope.Candidates.Count)
+                    throw new InvalidOperationException(
+                        $"Ни один товар не встречается минимум в {opt.ShopPercent}% магазинов ({needShops} из {scope.ShopSet.Count}){where}. " +
+                        $"Максимальный охват — {best} из {scope.ShopSet.Count} магазинов. Уменьшите процент магазинов. " +
+                        "Ничего не скачано.");
+                throw new InvalidOperationException(
+                    $"Товары, которые есть минимум в {opt.ShopPercent}% магазинов, нашлись ({scope.Candidates.Count - st.ShopDropped}), " +
+                    $"но у всех разброс цен между магазинами больше {opt.MaxSpreadPercent}%{where}. " +
+                    "Увеличьте допустимый разброс цен или уменьшите процент магазинов. Ничего не скачано.");
             }
 
             if (useShops)
                 L($"Фильтр по магазинам: товар должен быть минимум в {needShops} из {scope.ShopSet.Count} ({opt.ShopPercent}%); " +
                   $"отсеяно: {st.ShopDropped}");
-            L($"Порог разброса цен: {opt.MaxSpreadPercent}%");
-            L($"Взято товаров: {selected.Count} " +
-              $"(цена одинаковая: {st.Equal}, разница в пределах порога: {st.Similar}, единственная цена: {st.Single})");
-            L($"Пропущено из-за разброса цен: {st.Dropped}");
-            if (st.NoPrice > 0) L($"Пропущено без корректной цены: {st.NoPrice}");
+            if (scope.Preselected != null)
+            {
+                L($"Взято товаров: {selected.Count}");
+            }
+            else
+            {
+                L($"Порог разброса цен: {opt.MaxSpreadPercent}%");
+                L($"Взято товаров: {selected.Count} " +
+                  $"(цена одинаковая: {st.Equal}, разница в пределах порога: {st.Similar}, единственная цена: {st.Single})");
+                L($"Пропущено из-за разброса цен: {st.Dropped}");
+                if (st.NoPrice > 0) L($"Пропущено без корректной цены: {st.NoPrice}");
+            }
 
             if (selected.Count == 0)
-            {
-                L("Нет товаров для выгрузки.");
-                Pct(100);
-                return;
-            }
+                throw new InvalidOperationException(
+                    "Нет товаров для выгрузки" + (scope.Title.Length > 0 ? $" ({scope.Kind}: {scope.Title})" : "") + ". " +
+                    (st.Dropped > 0
+                        ? $"У всех товаров ({st.Dropped}) разброс цен больше {opt.MaxSpreadPercent}%. Увеличьте допустимую разницу цен."
+                        : "Подходящих товаров с ценой не нашлось."));
 
             // --- Картинки (скачиваются в общий кэш, повторно не качаются) ---
             int noImageUrl = 0, imageFailed = 0;
@@ -730,10 +810,49 @@ public static class Converter
             wb.SaveAs(path);
         }
 
+        // Таблица для подбора настроек: сколько товаров проходит при разном проценте магазинов
+        // и сколько из них с одной ценой (цена совпадает во всех магазинах) / с разбросом в допустимых пределах.
+        private void LogCoverageTable(Scope scope, int needShops, Action<string> L)
+        {
+            int total = scope.ShopSet.Count;
+            if (total <= 1 || scope.Candidates.Count == 0) return;
+
+            decimal limit = opt.MaxSpreadPercent / 100m;
+            var rows = new List<(int Cov, bool Equal, bool InSpread)>(scope.Candidates.Count);
+            foreach (var g in scope.Candidates)
+            {
+                var prices = ScopePrices(g, scope);
+                if (prices.Count == 0) continue;
+                decimal min = prices.Min(), max = prices.Max();
+                rows.Add((CountIn(g.Shops, scope.ShopSet), max == min, (max - min) / min <= limit));
+            }
+
+            var percents = new SortedSet<decimal>(new decimal[] { 100, 95, 90, 80, 70, 50, 30, 10, opt.ShopPercent });
+            L($"Охват по магазинам (всего магазинов: {total}, товаров с ценой: {rows.Count}). " +
+              $"Допустимая разница цен: {opt.MaxSpreadPercent}%:");
+            foreach (var p in percents.Reverse())
+            {
+                int need = Math.Max(1, (int)Math.Ceiling(total * p / 100m));
+                int pass = 0, eq = 0, sp = 0;
+                foreach (var r in rows)
+                {
+                    if (r.Cov < need) continue;
+                    pass++;
+                    if (r.Equal) eq++;
+                    if (r.InSpread) sp++;
+                }
+                string mark = p == opt.ShopPercent ? "  ◄ выбрано" : "";
+                L($"   минимум {p,3:0.##}% ({need} из {total}): товаров {pass}, с одной ценой {eq}, " +
+                  $"в пределах разброса {sp}{mark}");
+            }
+        }
+
         // ---------- Отбор товаров внутри одной выгрузки ----------
         private (List<(Group Group, decimal Price)> Items, SelStats Stats) SelectProducts(
             Scope scope, bool useShops, int needShops)
         {
+            if (scope.Preselected != null) return (scope.Preselected, new SelStats());
+
             decimal limit = opt.MaxSpreadPercent / 100m;
             var st = new SelStats();
             var list = new List<(Group Group, decimal Price)>();
@@ -776,6 +895,9 @@ public static class Converter
         }
 
         private GeoModel? currentGeo;   // заполняется при чтении, нужен для проверки региона оффера
+        // Регион = субъект РФ: включено в настройках и справочник найден
+        private bool BySubject => opt.RegionBySubject && RuGeo.Loaded;
+        private int scopeCount;         // сколько выгрузок (Excel) получится: таблицу охвата печатаем, только если их мало
 
         private bool InRegion(PriceEntry e, int region) =>
             currentGeo != null && CodeHas(currentGeo, currentGeo.CatRegions, e.Cat, region);
@@ -1052,28 +1174,34 @@ public static class Converter
             return (list, st.Count, geo);
         }
 
-        // Несколько YML-файлов в один результат: каждый файл — отдельный магазин (как каталог в JSON).
+        // Несколько файлов в один результат (YML и/или JSON).
+        // YML: каждый файл — отдельный магазин (как каталог в JSON).
+        // JSON: магазины берутся из каталогов (target_shops) внутри файла; если файл вообще без гео — он один магазин.
+        // Один и тот же магазин в разных файлах учитывается один раз, один и тот же товар — тоже один раз.
         // Дальше работают обычные механизмы: охват магазинов, разброс цен, один общий Excel и один набор картинок.
         private async Task<(List<Group> Groups, int OffersCount, GeoModel Geo)> ReadGroupsFeedsAsync()
         {
             var feeds = opt.Feeds!;
-            var list = new List<Group>();
-            var index = new Dictionary<string, Group>();
-
-            var geo = new GeoModel();
+            WarnNoGeoData();
+            var s = new ReadState();
+            var list = s.List;
+            var index = s.Index;
+            var geo = s.Geo;
             currentGeo = geo;
-            var shopIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var regionIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var catShops = new List<int[]>();
-            var catRegions = new List<int[]>();
+            var shopIndex = s.ShopIndex;
+            var regionIndex = s.RegionIndex;
+            var catShops = s.CatShops;
+            var catRegions = s.CatRegions;
             var usedLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var failedFeeds = new List<string>();
 
             string tmpFeed = Path.Combine(outDir, "_feed.tmp");
             tempJson = tmpFeed;                      // Cleanup удалит временный файл при любом исходе
 
-            int total = feeds.Count, okFeeds = 0, totalOffers = 0, totalNotPromo = 0;
-            log.Report($"Режим объединения: каждый файл — отдельный магазин, файлов в списке: {total}");
+            int total = feeds.Count, okFeeds = 0, totalOffers = 0, totalNotPromo = 0, totalDupShops = 0, totalSkipped = 0;
+            log.Report($"Режим объединения: файлов в списке: {total}");
+
+            PreCheckJson(feeds);
 
             for (int i = 0; i < total; i++)
             {
@@ -1081,7 +1209,7 @@ public static class Converter
                 var feed = feeds[i];
                 percent.Report(Math.Min(39, i * 40 / total));
 
-                // Название магазина должно быть уникальным, иначе два файла склеятся в один магазин
+                // Название должно быть уникальным, иначе два файла склеятся в один магазин
                 string label = string.IsNullOrWhiteSpace(feed.Label) ? $"feed_{i + 1}" : feed.Label.Trim();
                 string unique = label;
                 int k = 2;
@@ -1090,6 +1218,7 @@ public static class Converter
                 // Товары файла собираем отдельно и добавляем в общий набор только если файл прочитан целиком
                 var buffer = new List<(string Key, YmlOffer Offer)>();
                 YmlStats? st = null;
+                JsonFileStats? js = null;
                 try
                 {
                     string path = feed.Source.Trim();
@@ -1114,17 +1243,21 @@ public static class Converter
                         throw new FileNotFoundException("файл не найден");
                     }
 
-                    if (DetectFormat(path) != SourceFormat.Xml)
-                        throw new InvalidDataException("в режиме объединения поддерживаются только YML/XML-файлы");
-
-                    st = ReadYmlFile(path, o =>
+                    if (DetectFormat(path) == SourceFormat.Json)
                     {
-                        // Один и тот же товар в разных магазинах: совпадают id и название
-                        string key = o.Id.Length > 0 ? o.Id + "\u0001" + NormalizeText(o.Name) : NormalizeText(o.Name);
-                        buffer.Add((key, o));
-                    }, ct, null);
+                        js = ReadJsonFile(s, path, unique, feed, unique, atomic: true, null);
+                    }
+                    else
+                    {
+                        st = ReadYmlFile(path, o =>
+                        {
+                            // Один и тот же товар в разных магазинах: совпадают id и название
+                            string key = o.Id.Length > 0 ? o.Id + "\u0001" + NormalizeText(o.Name) : NormalizeText(o.Name);
+                            buffer.Add((key, o));
+                        }, ct, null);
 
-                    if (st.Count == 0) throw new InvalidDataException("в файле нет офферов");
+                        if (st.Count == 0) throw new InvalidDataException("в файле нет офферов");
+                    }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -1142,7 +1275,29 @@ public static class Converter
                     try { if (File.Exists(tmpFeed)) File.Delete(tmpFeed); } catch { }
                 }
 
-                // Файл прочитан: это новый «каталог» с одним магазином (и, если задан, регионом)
+                // ---------- JSON: файл уже добавлен в общий набор ----------
+                if (js != null)
+                {
+                    okFeeds++;
+                    totalOffers += js.Offers;
+                    totalNotPromo += js.NotPromo;
+                    totalDupShops += js.DuplicateCatalogs;
+                    totalSkipped += js.SkippedDuplicate;
+
+                    string what = js.WholeFileIsShop
+                        ? "в файле нет данных о магазинах — весь файл считается одним магазином"
+                        : js.Catalogs == 0 && js.DuplicateCatalogs > 0
+                            ? "файл целиком повторяет уже прочитанные"
+                            : $"магазинов {js.Catalogs}";
+                    if (js.DuplicateCatalogs > 0)
+                        what += $", повторных (уже были в других файлах) {js.DuplicateCatalogs} — пропущены";
+                    log.Report($"[{i + 1}/{total}] {unique}: {what}, офферов {js.Offers}, новых товаров {js.NewProducts}");
+
+                    if (opt.Economy) GC.Collect();   // слабый ПК: буфер файла больше не нужен
+                    continue;
+                }
+
+                // ---------- YML: файл — это новый «каталог» с одним магазином (и, если задан, регионом) ----------
                 int cat = catShops.Count;
                 int shop = Intern(shopIndex, geo.ShopNames, unique);
                 var regions = new HashSet<int>();
@@ -1177,23 +1332,17 @@ public static class Converter
                            $"Список для повторной загрузки: {failedPath}");
             }
             if (opt.PromoOnly)
-                log.Report($"Только акционные позиции: пропущено без oldprice — {totalNotPromo} из {totalOffers}");
-            log.Report($"Прочитано файлов (магазинов): {okFeeds}, уникальных товаров: {list.Count}");
+                log.Report($"Только акционные позиции: пропущено без oldprice / price_old — {totalNotPromo} из {totalOffers}");
+            if (totalDupShops > 0)
+                log.Report($"Повторяющихся магазинов пропущено: {totalDupShops} (офферов в них: {totalSkipped}). " +
+                           "Каждый магазин и каждый товар учтены один раз.");
 
-            // Магазины и регионы товара: по файлам, в которых он встретился
-            geo.CatShops = catShops.ToArray();
-            geo.CatRegions = catRegions.ToArray();
-            foreach (var g in list)
-            {
-                ct.ThrowIfCancellationRequested();
-                var seen = new HashSet<int>();
-                foreach (var e in g.Offers)
-                    if (e.Cat != -1 && seen.Add(e.Cat)) AddGeo(g, geo, e.Cat);
-
-                g.Offers.TrimExcess();
-                geo.UsedShops.UnionWith(g.Shops);
-                geo.UsedRegions.UnionWith(g.Regions);
-            }
+            // Магазины и регионы товара: по файлам и каталогам, в которых он встретился
+            FinishGeo(s);
+            ReportDerivedRegions(s);
+            log.Report($"Прочитано файлов: {okFeeds}, магазинов: {geo.UsedShops.Count}" +
+                       (geo.UsedRegions.Count > 0 ? $", регионов: {geo.UsedRegions.Count}" : "") +
+                       $", уникальных товаров: {list.Count}");
 
             return (list, totalOffers, geo);
         }
@@ -1213,48 +1362,159 @@ public static class Converter
         // JSON читается потоком (Utf8JsonReader): в памяти одновременно только один оффер, поэтому расход
         // памяти зависит от числа уникальных товаров, а не от размера файла. Два прохода по файлу:
         // сначала каталоги (география), затем офферы.
-        private (List<Group> Groups, int OffersCount, GeoModel Geo) ReadGroups(string jsonPath, CancellationToken ct)
+        // Один и тот же код читает и одиночный файл, и каждый файл в режиме объединения.
+
+        // Всё, что накапливается при чтении: товары, магазины, регионы, каталоги.
+        private sealed class ReadState
         {
-            var list = new List<Group>();
-            var index = new Dictionary<string, Group>();
-            int count = 0;
+            public readonly List<Group> List = new();
+            public readonly Dictionary<string, Group> Index = new();
+            public readonly GeoModel Geo = new();
+            public readonly Dictionary<string, int> ShopIndex = new(StringComparer.OrdinalIgnoreCase);
+            public readonly Dictionary<string, int> RegionIndex = new(StringComparer.OrdinalIgnoreCase);
+            public readonly List<int[]> CatRegions = new();
+            public readonly List<int[]> CatShops = new();
+            // Каталоги, уже прочитанные из предыдущих файлов: ключ каталога -> имя файла
+            public readonly Dictionary<string, string> CatalogOwners = new(StringComparer.OrdinalIgnoreCase);
+            public int DerivedCatalogs;                       // у скольких каталогов регион определён по адресу магазина
+            public readonly HashSet<string> UnparsedAddresses = new(StringComparer.OrdinalIgnoreCase);
+        }
 
-            // --- География из каталогов: target_shops (магазины), target_regions или region (регионы) ---
-            var geo = new GeoModel();
-            var shopIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var regionIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var catRegions = new List<int[]>();
-            var catShops = new List<int[]>();
+        private sealed class JsonFileStats
+        {
+            public int Catalogs, DuplicateCatalogs, Offers, NotPromo, SkippedDuplicate, NewProducts;
+            public bool WholeFileIsShop;     // в файле нет ни магазинов, ни регионов: весь файл считаем одним магазином
+        }
 
-            // 64-битный хэш id оффера -> каталог (или код нескольких каталогов, см. PriceEntry.Cat).
-            // Хэш вместо строки-ключа: в разы меньше памяти на миллионах офферов.
-            var offerCats = new Dictionary<ulong, int>();
+        private readonly record struct BufferedOffer(
+            string Key, string? Description, string? Image, DateTime? DateStart, DateTime? DateEnd, decimal Price, int Cat);
+
+        // Магазины (target_shops) и регионы (target_regions, иначе region) одного каталога.
+        // Если регионов нет, а режим регионов включён (deriveFromAddress), регионом считается город из адреса магазина.
+        // derived = true, если регионы получены именно так; unparsed получает адреса, из которых город определить не удалось.
+        private static void ReadCatalogGeo(JsonElement c, bool deriveFromAddress, bool bySubject, List<string>? unparsed,
+                                           out List<string> shops, out List<string> regions, out bool derived)
+        {
+            derived = false;
+            regions = GetStringList(c, "target_regions").Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (regions.Count == 0)
+            {
+                string? one = GetString(c, "region");
+                if (!string.IsNullOrWhiteSpace(one)) regions.Add(one.Trim());
+            }
+            shops = GetStringList(c, "target_shops").Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            // Названия из target_regions приводим к официальным по справочнику («Московская обл.» -> «Московская область»);
+            // в режиме субъектов РФ город из target_regions заменяется его регионом
+            if (regions.Count > 0 && RuGeo.Loaded)
+                regions = regions.Select(x => RuGeo.NormalizeRegion(x, bySubject) ?? x)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            if (regions.Count == 0 && deriveFromAddress && shops.Count > 0)
+            {
+                foreach (var sh in shops)
+                {
+                    string? city = bySubject ? RuGeo.RegionOfAddress(sh) : CityFromAddress(sh);
+                    if (city == null) unparsed?.Add(sh);
+                    else if (!regions.Contains(city, StringComparer.OrdinalIgnoreCase)) regions.Add(city);
+                }
+                derived = true;
+            }
+        }
+
+        private static readonly Regex SettlementPrefixRx = new(
+            @"^(?:г|город|пгт|рп|р\.п|пос|посёлок|поселок|п|с|село|ст-ца|станица|х|хутор|аул|дер|деревня)(?:\.\s*|\s+)(?<n>\p{L}.*)$",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex SettlementSuffixRx = new(
+            @"^(?<n>\p{L}.*?)\s+(?:г|гор)\.?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex SkipPartRx = new(
+            @"^(?:россия|рф|russia|\d{5,6}|\d.*)$|обл(?:\.|асть|\b)|край\b|респ(?:\.|ублика|\b)|автоном|\bао\b|округ|район|р-н",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex StreetPartRx = new(
+            @"^(?:ул|улица|пр|пр-т|просп|проспект|пер|переулок|б-р|бульвар|ш|шоссе|наб|набережная|пл|площадь|тракт|проезд|аллея|линия|мкр|микрорайон|тц|трц|тк|д|дом|к|корп|стр|вл|кв|пом|литер|лит)(?:\.|\s|$)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// <summary>Город из адреса: «г. Москва, пр. Ленинградский, д. 77» -> «Москва». null, если определить не удалось.</summary>
+        public static string? CityFromAddress(string address)
+        {
+            var parts = address.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            if (parts.Count == 0) return null;
+
+            // 1. Явный населённый пункт: «г. Химки», «город Химки», «г Химки», «Химки г.», «пгт Янтарный»
+            foreach (var p in parts)
+            {
+                var m = SettlementPrefixRx.Match(p);
+                if (!m.Success) m = SettlementSuffixRx.Match(p);
+                if (m.Success) return CleanCity(m.Groups["n"].Value);
+            }
+
+            // 2. Без пометки («Москва, ул. Ленина, 5»): первая часть, которая не страна, не индекс, не область и не улица
+            foreach (var p in parts)
+            {
+                if (SkipPartRx.IsMatch(p) || StreetPartRx.IsMatch(p)) continue;
+                return CleanCity(p);
+            }
+            return null;
+        }
+
+        private static string? CleanCity(string s)
+        {
+            s = Regex.Replace(s, @"\s+", " ").Trim(' ', '.', ',', ';');
+            return s.Length == 0 ? null : s;
+        }
+
+        // Каталог из другого файла считается повтором, только если совпадает всё: id, магазины и регионы.
+        // Без id, магазинов и регионов каталог повтором не считается никогда.
+        private static string? BuildCatalogKey(string? id, List<string> shops, List<string> regions)
+        {
+            if (string.IsNullOrWhiteSpace(id) && shops.Count == 0 && regions.Count == 0) return null;
+            return (id?.Trim() ?? "") + "\u0001" +
+                   string.Join("|", shops.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + "\u0001" +
+                   string.Join("|", regions.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
+        }
+
+        // Читает один JSON-файл в общее состояние.
+        // atomic = true (режим объединения): товары файла сначала копятся отдельно и попадают в общий набор только
+        // после чтения всего файла, поэтому битый файл ничего не портит и просто пропускается.
+        // atomic = false (один файл): товары сразу идут в общий набор — так меньше памяти на очень больших файлах.
+        private JsonFileStats ReadJsonFile(ReadState s, string path, string fileName, FeedSource? feed,
+                                           string? label, bool atomic, Action<int>? onPercent)
+        {
+            var st = new JsonFileStats();
+            var geo = s.Geo;
+
+            int baseCat = s.CatShops.Count;       // индекс первого каталога этого файла в общем списке
+            int baseMulti = geo.Multi.Count;      // индекс первого «составного» кода (оффер в нескольких каталогах)
+
+            var localCats = new List<(string[] Shops, string[] Regions, bool Derived)>();
+            bool deriveRegions = opt.RegionMode is RegionMode.AllRegions or RegionMode.PerRegion or RegionMode.RegionsMerged;
+            var unparsed = new List<string>();
+            var localMulti = new List<int[]>();           // коды каталогов уже в общей нумерации
+            var ownedKeys = new List<string>();
+            var offerCats = new Dictionary<ulong, int>(); // хэш id оффера -> каталог (общая нумерация) или составной код
+            HashSet<ulong>? skipped = null;               // офферы каталогов, которые уже были в предыдущих файлах
+            bool anyGeo = false;
 
             // Проход 1: каталоги
-            ScanArray(jsonPath, "catalogs", c =>
+            ScanArray(path, "catalogs", c =>
             {
-                int ci = catRegions.Count;
+                ReadCatalogGeo(c, deriveRegions, BySubject, unparsed, out var shops, out var regions, out var derived);
+                string? key = BuildCatalogKey(GetString(c, "id"), shops, regions);
+                bool dup = key != null && s.CatalogOwners.ContainsKey(key);
 
-                var regions = new HashSet<int>();
-                foreach (var name in GetStringList(c, "target_regions"))
-                    regions.Add(Intern(regionIndex, geo.RegionNames, name));
-                if (regions.Count == 0)
+                int ci = baseCat + localCats.Count;
+                if (dup)
                 {
-                    string? one = GetString(c, "region");
-                    if (!string.IsNullOrWhiteSpace(one)) regions.Add(Intern(regionIndex, geo.RegionNames, one));
+                    st.DuplicateCatalogs++;
                 }
-
-                var shops = new HashSet<int>();
-                foreach (var name in GetStringList(c, "target_shops"))
-                    shops.Add(Intern(shopIndex, geo.ShopNames, name));
-
-                catRegions.Add(regions.ToArray());
-                catShops.Add(shops.ToArray());
-
-                foreach (var r in regions)
+                else
                 {
-                    if (!geo.RegionShops.TryGetValue(r, out var rs)) geo.RegionShops[r] = rs = new HashSet<int>();
-                    rs.UnionWith(shops);
+                    localCats.Add((shops.ToArray(), regions.ToArray(), derived));
+                    if (derived) s.DerivedCatalogs++;
+                    if (key != null) ownedKeys.Add(key);
+                    if (shops.Count > 0 || regions.Count > 0) anyGeo = true;
                 }
 
                 if (c.TryGetProperty("offers", out var ids) && ids.ValueKind == JsonValueKind.Array)
@@ -1266,6 +1526,13 @@ public static class Converter
                         if (string.IsNullOrEmpty(oid)) continue;
 
                         ulong h = HashId(oid);
+
+                        if (dup)
+                        {
+                            (skipped ??= new HashSet<ulong>()).Add(h);
+                            continue;
+                        }
+
                         if (!offerCats.TryGetValue(h, out var code))
                         {
                             offerCats[h] = ci;
@@ -1276,45 +1543,102 @@ public static class Converter
                         }
                         else if (code >= 0)
                         {
-                            geo.Multi.Add(new[] { code, ci });
-                            offerCats[h] = -(geo.Multi.Count - 1) - 2;
+                            localMulti.Add(new[] { code, ci });
+                            offerCats[h] = -(baseMulti + localMulti.Count - 1) - 2;
                         }
                         else
                         {
-                            int mi = -code - 2;
-                            var old = geo.Multi[mi];
+                            int mi = -code - 2 - baseMulti;
+                            var old = localMulti[mi];
                             if (Array.IndexOf(old, ci) < 0)
                             {
                                 var arr = new int[old.Length + 1];
                                 old.CopyTo(arr, 0);
                                 arr[^1] = ci;
-                                geo.Multi[mi] = arr;
+                                localMulti[mi] = arr;
                             }
                         }
                     }
                 }
             }, ct);
 
-            geo.CatRegions = catRegions.ToArray();
-            geo.CatShops = catShops.ToArray();
-            currentGeo = geo;
+            // В режиме объединения файл без всякой географии — это один магазин (как YML-файл)
+            int? wholeFileCat = null;
+            if (feed != null && !anyGeo && st.DuplicateCatalogs == 0)
+            {
+                st.WholeFileIsShop = true;
+                st.DuplicateCatalogs = 0;
+                skipped = null;
+                localCats.Clear();
+                localMulti.Clear();
+                ownedKeys.Clear();
+                localCats.Add((new[] { (label ?? fileName).Trim() },
+                               string.IsNullOrWhiteSpace(feed.Region) ? Array.Empty<string>() : new[] { feed.Region.Trim() }, false));
+                wholeFileCat = baseCat;
+            }
+            st.Catalogs = localCats.Count;
+            foreach (var u in unparsed) s.UnparsedAddresses.Add(u);
+
+            // Каталоги переносим в общее состояние (магазины и регионы получают общие номера)
+            void CommitCatalogs()
+            {
+                foreach (var m in localMulti) geo.Multi.Add(m);
+                foreach (var (shopNames, regionNames, derived) in localCats)
+                {
+                    var shops = shopNames.Select(n => Intern(s.ShopIndex, geo.ShopNames, n)).Distinct().ToArray();
+                    var regions = regionNames.Select(n => Intern(s.RegionIndex, geo.RegionNames, n)).Distinct().ToArray();
+                    s.CatShops.Add(shops);
+                    s.CatRegions.Add(regions);
+
+                    if (derived)
+                    {
+                        // Регион получен из адресов: каждый магазин относим только к городу из его собственного адреса
+                        foreach (var sn in shopNames)
+                        {
+                            string? city = BySubject ? RuGeo.RegionOfAddress(sn) : CityFromAddress(sn);
+                            if (city == null) continue;
+                            int r = Intern(s.RegionIndex, geo.RegionNames, city);
+                            if (!geo.RegionShops.TryGetValue(r, out var rs)) geo.RegionShops[r] = rs = new HashSet<int>();
+                            rs.Add(Intern(s.ShopIndex, geo.ShopNames, sn));
+                        }
+                        continue;
+                    }
+                    foreach (var r in regions)
+                    {
+                        if (!geo.RegionShops.TryGetValue(r, out var rs)) geo.RegionShops[r] = rs = new HashSet<int>();
+                        rs.UnionWith(shops);
+                    }
+                }
+                foreach (var k in ownedKeys) s.CatalogOwners.TryAdd(k, fileName);
+            }
+
+            if (!atomic) CommitCatalogs();
 
             // Проход 2: офферы
-            int nextLog = 10;
-            int notPromo = 0;
-            bool found = ScanArray(jsonPath, "offers", o =>
+            var buffer = atomic ? new List<BufferedOffer>() : null;
+            var localSeen = atomic ? new HashSet<string>() : null;   // у первого оффера товара в файле берём текст и картинку
+
+            bool found = ScanArray(path, "offers", o =>
             {
-                count++;
+                st.Offers++;
 
                 // Режим «только акции»: оффер без корректной старой цены (price_old) не учитываем совсем —
                 // ни в ценах, ни в охвате магазинов и регионов
                 if (opt.PromoOnly)
                 {
                     var oldPrice = GetDecimal(o, "price_old");
-                    if (!(oldPrice.HasValue && oldPrice.Value > 0)) { notPromo++; return; }
+                    if (!(oldPrice.HasValue && oldPrice.Value > 0)) { st.NotPromo++; return; }
                 }
 
                 string id = GetString(o, "id") ?? "";
+                ulong h = id.Length > 0 ? HashId(id) : 0UL;
+
+                // Оффер каталога, который уже был в предыдущем файле, второй раз не берём
+                if (skipped != null && id.Length > 0 && skipped.Contains(h) && !offerCats.ContainsKey(h))
+                {
+                    st.SkippedDuplicate++;
+                    return;
+                }
 
                 // id вида "<код товара>_<регион/магазин>" -> ключ товара = часть до первого "_".
                 // Если "_" нет (как в palich), каждая запись — отдельный товар.
@@ -1323,23 +1647,117 @@ public static class Converter
                 if (us > 0) key = id[..us];
                 else key = id.Length > 0 ? id : (GetString(o, "description") ?? "");
 
-                if (!index.TryGetValue(key, out var grp))
-                {
-                    grp = new Group();
-                    index[key] = grp;
-                    list.Add(grp);
-                }
-
-                // Текст, ссылку и даты читаем только пока они не найдены — лишних строк не создаём
-                if (grp.Description.Length == 0) grp.Description = GetString(o, "description") ?? "";
-                if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = GetString(o, "image");
-                if (!grp.DateStart.HasValue) grp.DateStart = GetDate(o, "date_start");
-                if (!grp.DateEnd.HasValue) grp.DateEnd = GetDate(o, "date_end");
-
-                int cat = (id.Length > 0 && offerCats.TryGetValue(HashId(id), out var cc)) ? cc : -1;
+                int cat = wholeFileCat ?? ((id.Length > 0 && offerCats.TryGetValue(h, out var cc)) ? cc : -1);
                 var price = GetDecimal(o, "price_new");
-                grp.Offers.Add(new PriceEntry(price.HasValue && price.Value > 0 ? price.Value : 0m, cat));
-            }, ct, p =>
+                decimal p = price.HasValue && price.Value > 0 ? price.Value : 0m;
+
+                if (buffer == null)
+                {
+                    if (!s.Index.TryGetValue(key, out var grp))
+                    {
+                        grp = new Group();
+                        s.Index[key] = grp;
+                        s.List.Add(grp);
+                        st.NewProducts++;
+                    }
+
+                    // Текст, ссылку и даты читаем только пока они не найдены — лишних строк не создаём
+                    if (grp.Description.Length == 0) grp.Description = GetString(o, "description") ?? "";
+                    if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = GetString(o, "image");
+                    if (!grp.DateStart.HasValue) grp.DateStart = GetDate(o, "date_start");
+                    if (!grp.DateEnd.HasValue) grp.DateEnd = GetDate(o, "date_end");
+                    grp.Offers.Add(new PriceEntry(p, cat));
+                }
+                else
+                {
+                    string? desc = null, img = null;
+                    DateTime? ds = null, de = null;
+                    if (localSeen!.Add(key))
+                    {
+                        desc = GetString(o, "description");
+                        img = GetString(o, "image");
+                        ds = GetDate(o, "date_start");
+                        de = GetDate(o, "date_end");
+                    }
+                    buffer.Add(new BufferedOffer(key, desc, img, ds, de, p, cat));
+                }
+            }, ct, onPercent);
+
+            if (!found) throw new Exception("В JSON нет массива \"offers\".");
+
+            if (atomic)
+            {
+                if (st.Offers == 0) throw new InvalidDataException("в файле нет офферов");
+
+                CommitCatalogs();
+                foreach (var b in buffer!)
+                {
+                    if (!s.Index.TryGetValue(b.Key, out var grp))
+                    {
+                        grp = new Group();
+                        s.Index[b.Key] = grp;
+                        s.List.Add(grp);
+                        st.NewProducts++;
+                    }
+                    if (grp.Description.Length == 0 && b.Description != null) grp.Description = b.Description;
+                    if (string.IsNullOrWhiteSpace(grp.ImageUrl)) grp.ImageUrl = b.Image;
+                    if (!grp.DateStart.HasValue) grp.DateStart = b.DateStart;
+                    if (!grp.DateEnd.HasValue) grp.DateEnd = b.DateEnd;
+                    grp.Offers.Add(new PriceEntry(b.Price, b.Cat));
+                }
+                buffer!.Clear();
+            }
+
+            return st;
+        }
+
+        // Магазины и регионы товара считаем один раз по уникальным каталогам его офферов.
+        // Учитываем только магазины и регионы, в которых реально есть товары (пустые каталоги не считаем).
+        private void FinishGeo(ReadState s)
+        {
+            s.Geo.CatShops = s.CatShops.ToArray();
+            s.Geo.CatRegions = s.CatRegions.ToArray();
+            currentGeo = s.Geo;
+
+            foreach (var g in s.List)
+            {
+                ct.ThrowIfCancellationRequested();
+                var seen = new HashSet<int>();
+                foreach (var e in g.Offers)
+                    if (e.Cat != -1 && seen.Add(e.Cat)) AddGeo(g, s.Geo, e.Cat);
+
+                g.Offers.TrimExcess();
+                s.Geo.UsedShops.UnionWith(g.Shops);
+                s.Geo.UsedRegions.UnionWith(g.Regions);
+            }
+        }
+
+        // Сообщает, если регионы определялись по адресам магазинов
+        private void ReportDerivedRegions(ReadState s)
+        {
+            if (s.DerivedCatalogs == 0) return;
+            log.Report($"Регионы определены по адресам магазинов (target_regions в файлах нет): найдено {s.Geo.RegionNames.Count} " +
+                       (BySubject ? "(субъекты РФ по справочнику)." : "(города)."));
+            if (s.UnparsedAddresses.Count > 0)
+                log.Report($"⚠ Не удалось определить {(BySubject ? "регион" : "город")} у {s.UnparsedAddresses.Count} адресов, они не попадут ни в один регион. " +
+                           $"Например: {string.Join(" | ", s.UnparsedAddresses.Take(3))}");
+        }
+
+        private void WarnNoGeoData()
+        {
+            if (opt.RegionBySubject && !RuGeo.Loaded)
+                log.Report("⚠ Справочник регионов (ru_geo.tsv) не встроен в программу: регионами останутся города из адресов. " +
+                           "Добавьте ru_geo.tsv в проект как EmbeddedResource.");
+        }
+
+        private (List<Group> Groups, int OffersCount, GeoModel Geo) ReadGroups(string jsonPath, CancellationToken ct)
+        {
+            WarnNoGeoData();
+            var s = new ReadState();
+            currentGeo = s.Geo;
+
+            int nextLog = 10;
+            var st = ReadJsonFile(s, jsonPath, Path.GetFileName(jsonPath), null, null, atomic: false, p =>
             {
                 if (p >= nextLog)
                 {
@@ -1348,25 +1766,92 @@ public static class Converter
                 }
             });
 
-            if (!found) throw new Exception("В JSON нет массива \"offers\".");
             if (opt.PromoOnly)
-                log.Report($"Только акционные позиции: пропущено без price_old — {notPromo} из {count}");
+                log.Report($"Только акционные позиции: пропущено без price_old — {st.NotPromo} из {st.Offers}");
 
-            // Магазины и регионы товара считаем один раз по уникальным каталогам его офферов.
-            // Учитываем только магазины и регионы, в которых реально есть товары (пустые каталоги не считаем).
-            foreach (var g in list)
+            FinishGeo(s);
+            ReportDerivedRegions(s);
+            return (s.List, st.Offers, s.Geo);
+        }
+
+        // Быстрая проверка локальных JSON перед долгим чтением: читаются только каталоги (они обычно в начале файла),
+        // поэтому это занимает секунды. Сообщает о битых файлах, о повторяющихся магазинах и о числе магазинов.
+        // Ссылки не проверяются: ради этого пришлось бы скачивать их дважды.
+        private void PreCheckJson(IReadOnlyList<FeedSource> feeds)
+        {
+            var owners = new Dictionary<string, (int Index, string Name)>(StringComparer.OrdinalIgnoreCase);
+            var shopNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var regionNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int files = 0, bad = 0, cats = 0, dups = 0;
+            bool deriveRegions = opt.RegionMode is RegionMode.AllRegions or RegionMode.PerRegion or RegionMode.RegionsMerged;
+
+            for (int i = 0; i < feeds.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                var seen = new HashSet<int>();
-                foreach (var e in g.Offers)
-                    if (e.Cat != -1 && seen.Add(e.Cat)) AddGeo(g, geo, e.Cat);
+                string path = feeds[i].Source.Trim();
+                if (IsUrl(path) || !File.Exists(path)) continue;
 
-                g.Offers.TrimExcess();
-                geo.UsedShops.UnionWith(g.Shops);
-                geo.UsedRegions.UnionWith(g.Regions);
+                try { if (DetectFormat(path) != SourceFormat.Json) continue; }
+                catch { continue; }
+
+                files++;
+                int fileNo = i;
+                string name = Path.GetFileName(path);
+                int fileCats = 0, fileDups = 0;
+                var firstFiles = new HashSet<string>();
+
+                try
+                {
+                    bool found = ScanArray(path, "catalogs", c =>
+                    {
+                        ReadCatalogGeo(c, deriveRegions, BySubject, null, out var shops, out var regions, out _);
+                        string? key = BuildCatalogKey(GetString(c, "id"), shops, regions);
+                        fileCats++;
+                        if (key != null)
+                        {
+                            if (owners.TryGetValue(key, out var first))
+                            {
+                                if (first.Index != fileNo)     // повтор внутри одного файла повтором не считаем
+                                {
+                                    fileDups++;
+                                    firstFiles.Add(first.Name);
+                                }
+                            }
+                            else owners[key] = (fileNo, name);
+                        }
+                        foreach (var sh in shops) shopNames.Add(sh);
+                        foreach (var rg in regions) regionNames.Add(rg);
+                    }, ct);
+
+                    if (!found)
+                        log.Report($"  Проверка: {name} — нет массива catalogs, файл будет считаться одним магазином.");
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    bad++;
+                    log.Report($"  ⚠ Проверка: {name} — не читается ({ex.Message}). Файл будет пропущен.");
+                    continue;
+                }
+
+                cats += fileCats;
+                dups += fileDups;
+                if (fileDups > 0)
+                    log.Report($"  Проверка: {name} — повторяющихся магазинов {fileDups} из {fileCats} " +
+                               $"(уже есть в: {string.Join(", ", firstFiles.Take(3))}); они будут пропущены.");
             }
 
-            return (list, count, geo);
+            if (files == 0) return;
+
+            log.Report($"Проверка JSON: файлов {files}, каталогов {cats}, разных магазинов {shopNames.Count}" +
+                       (regionNames.Count > 0 ? $", регионов {regionNames.Count}" : "") +
+                       (dups > 0 ? $", повторов {dups} (пропущу)" : ", повторов нет") +
+                       (bad > 0 ? $", не читаются: {bad}" : ""));
+            if (opt.ShopFilter && shopNames.Count > 1 &&
+                opt.RegionMode is not (RegionMode.PerRegion or RegionMode.RegionsMerged or RegionMode.PerShop))
+            {
+                int need = (int)Math.Ceiling(shopNames.Count * opt.ShopPercent / 100m);
+                log.Report($"Фильтр по магазинам: товар должен быть минимум в {need} из {shopNames.Count} магазинов ({opt.ShopPercent}%).");
+            }
         }
     }
 

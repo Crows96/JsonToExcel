@@ -24,4 +24,9 @@
     <PackageReference Include="SkiaSharp" Version="2.88.9" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Справочник городов и регионов России: встраивается в exe, отдельный файл рядом не нужен -->
+    <EmbeddedResource Include="ru_geo.tsv" LogicalName="ru_geo.tsv" />
+  </ItemGroup>
+
 </Project>

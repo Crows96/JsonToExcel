@@ -15,6 +15,7 @@ public sealed class UiSettings
     public bool ShopFilter { get; set; } = true;
     public decimal ShopPercent { get; set; } = 95;
     public int GeoMode { get; set; }
+    public bool RegionBySubject { get; set; }
     public bool Combine { get; set; }
     public bool Economy { get; set; }
     public int Threads { get; set; } = 16;
